@@ -1,0 +1,9 @@
+manifest_version: 1
+versions:
+  - version: 1
+    description: "Initial soma_observe schema: metric series, metric points (partitioned), histogram points (partitioned), logs (partitioned)"
+    migrations:
+      - file: "20260628_01_init.sql"
+        created: "2026-06-28"
+        author: "soma-observe"
+        why: "Bootstrap the partitioned observability schema. Child partitions are created at runtime by the partition manager (T6), not in this migration."

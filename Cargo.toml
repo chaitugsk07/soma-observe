@@ -1,0 +1,43 @@
+[package]
+name = "soma-observe"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "OpenTelemetry observability ingest + query service for the soma-platform: OTLP/HTTP receiver for metrics and logs, stored in partitioned Postgres."
+keywords = ["opentelemetry", "observability", "metrics", "logs", "otlp"]
+categories = ["database", "web-programming"]
+
+[[bin]]
+name = "soma-observe"
+path = "src/main.rs"
+
+[dependencies]
+soma-infra = { path = "../soma-infra", features = ["db", "tracing", "config", "signal", "web", "testing"] }
+rust-embed = "8"
+soma-schema = { path = "../soma-schema", version = "0.4", default-features = false }
+include_dir = "0.7"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+# opentelemetry-proto: gen-tonic-messages gives the OTLP collector request/response
+# types used in T4 (decode ExportMetricsServiceRequest / ExportLogsServiceRequest).
+# with-serde enables JSON deserialization for OTLP/JSON payloads.
+# gen-tonic-messages pulls in tonic (message layer only, no transport).
+opentelemetry-proto = { version = "0.28", default-features = false, features = ["gen-tonic-messages", "metrics", "logs", "with-serde"] }
+prost = "0.13"
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json"], default-features = false }
+# ponytail: lru = bounded LRU for series_id cache; no stdlib equivalent
+lru = "0.12"
+
+[dev-dependencies]
+# tower::ServiceExt provides .oneshot() for testing axum routers in-process.
+tower = { version = "0.5", features = ["util"] }
+
+[profile.dev]
+debug = false
+strip = true
