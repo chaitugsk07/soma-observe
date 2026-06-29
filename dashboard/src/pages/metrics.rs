@@ -3,15 +3,16 @@
 use crate::api::{query_metrics, get_metric_names, get_metric_series, HistogramSummary, MetricPoint, MetricSeries};
 use crate::app::AppCtx;
 use leptos::prelude::*;
+use leptos_router::hooks::use_navigate;
+use leptos_router::NavigateOptions;
 use soma_ui::{
     Alert, AlertDescription, AlertTitle, AlertVariant, Badge, BadgeVariant, BarChart, BarVariant,
-    Button, ButtonSize, ButtonVariant, Column, DataTable, Empty, Input, LineChart, LineVariant,
+    Button, ButtonSize, ButtonVariant, Empty, Input, LineChart, LineVariant,
     PageHeader, Select, SelectContent, SelectItem, Spinner, Table, TableBody, TableCell,
     TableHead, TableHeader, TableRow,
 };
 use soma_ui::ChartPoint;
 use soma_ui::ChartSeries;
-use std::collections::HashMap;
 
 fn short_ts(ts: &str) -> String {
     // Extract HH:MM from ISO-8601 or unix-seconds string.
@@ -33,25 +34,10 @@ fn metric_series_label(s: &MetricSeries) -> String {
     format!("series {}", s.series_id)
 }
 
-fn point_row(idx: usize, p: &MetricPoint) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("idx".to_string(), idx.to_string());
-    m.insert("start".to_string(), p.start.clone());
-    m.insert("end".to_string(), p.end.clone());
-    m.insert(
-        "value".to_string(),
-        p.value.map(|v| format!("{:.4}", v)).unwrap_or_else(|| "—".to_string()),
-    );
-    m.insert(
-        "count".to_string(),
-        p.count.map(|c| c.to_string()).unwrap_or_else(|| "—".to_string()),
-    );
-    m
-}
-
 #[component]
 pub fn MetricsPage() -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("AppCtx required");
+    let navigate = use_navigate();
 
     // --- Metric name list ---
     let names: RwSignal<Vec<String>> = RwSignal::new(vec![]);
@@ -309,6 +295,7 @@ pub fn MetricsPage() -> impl IntoView {
 
             // Chart
             {move || {
+                let navigate = navigate.clone();
                 if query_loading.get() {
                     return view! { <div class="flex justify-center py-8"><Spinner /></div> }.into_any();
                 }
@@ -392,22 +379,54 @@ pub fn MetricsPage() -> impl IntoView {
                                 each=move || raw_points.get()
                                 key=|(label, _)| label.clone()
                                 children=move |(label, points)| {
-                                    let cols = vec![
-                                        Column { key: "idx".to_string(), header: "#".to_string(), sortable: false, editable: false },
-                                        Column { key: "start".to_string(), header: "Start".to_string(), sortable: false, editable: false },
-                                        Column { key: "end".to_string(), header: "End".to_string(), sortable: false, editable: false },
-                                        Column { key: "value".to_string(), header: "Value".to_string(), sortable: true, editable: false },
-                                        Column { key: "count".to_string(), header: "Count".to_string(), sortable: false, editable: false },
-                                    ];
-                                    let rows: Vec<HashMap<String, String>> = points
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, p)| point_row(i + 1, p))
-                                        .collect();
+                                    let nav = navigate.clone();
+                                    let point_rows: Vec<_> = points.into_iter().enumerate().map(|(i, p)| {
+                                        let value_str = p.value.map(|v| format!("{:.4}", v)).unwrap_or_else(|| "—".to_string());
+                                        let count_str = p.count.map(|c| c.to_string()).unwrap_or_else(|| "—".to_string());
+                                        let exemplar = p.exemplar_trace_id.clone();
+                                        let nav2 = nav.clone();
+                                        let exemplar_cell = exemplar.map(|tid| {
+                                            let href = format!("/traces?trace_id={}", tid);
+                                            let nav3 = nav2.clone();
+                                            view! {
+                                                <button
+                                                    class="text-primary hover:underline font-mono"
+                                                    title=tid.clone()
+                                                    on:click=move |_| { nav3(&href, NavigateOptions::default()); }
+                                                >
+                                                    "\u{21aa} trace"
+                                                </button>
+                                            }.into_any()
+                                        }).unwrap_or_else(|| view! { <span /> }.into_any());
+                                        view! {
+                                            <TableRow>
+                                                <TableCell class="text-xs tabular-nums text-muted-foreground".to_string()>{i + 1}</TableCell>
+                                                <TableCell class="text-xs font-mono".to_string()>{p.start.clone()}</TableCell>
+                                                <TableCell class="text-xs font-mono".to_string()>{p.end.clone()}</TableCell>
+                                                <TableCell class="text-xs tabular-nums".to_string()>{value_str}</TableCell>
+                                                <TableCell class="text-xs tabular-nums".to_string()>{count_str}</TableCell>
+                                                <TableCell class="text-xs".to_string()>{exemplar_cell}</TableCell>
+                                            </TableRow>
+                                        }
+                                    }).collect();
                                     view! {
                                         <div>
                                             <p class="text-xs font-mono text-muted-foreground mb-1">{label}</p>
-                                            <DataTable columns=cols rows=rows page_size=20 />
+                                            <Table>
+                                                <TableHeader>
+                                                    <TableRow>
+                                                        <TableHead class="w-8".to_string()>"#"</TableHead>
+                                                        <TableHead>"Start"</TableHead>
+                                                        <TableHead>"End"</TableHead>
+                                                        <TableHead class="w-24".to_string()>"Value"</TableHead>
+                                                        <TableHead class="w-20".to_string()>"Count"</TableHead>
+                                                        <TableHead class="w-24".to_string()>"Exemplar"</TableHead>
+                                                    </TableRow>
+                                                </TableHeader>
+                                                <TableBody>
+                                                    {point_rows}
+                                                </TableBody>
+                                            </Table>
                                         </div>
                                     }
                                 }

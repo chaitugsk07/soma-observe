@@ -21,3 +21,10 @@ versions:
         created: "2026-06-29"
         author: "soma-observe"
         why: "Bootstrap minimal-credible alerting: metric-threshold and log-count rules with webhook notifications."
+  - version: 4
+    description: "Add exemplar_trace_id / exemplar_span_id to metric_point for metric→trace cross-signal correlation"
+    migrations:
+      - file: "20260629_03_exemplars.sql"
+        created: "2026-06-29"
+        author: "soma-observe"
+        why: "OTLP NumberDataPoints carry exemplars (sampled trace_id/span_id). Storing them on metric_point lets the UI deep-link from a metric data point to the corresponding trace."

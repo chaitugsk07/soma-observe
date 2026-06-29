@@ -15,17 +15,29 @@ pub async fn write_metric_points(pool: &PgPool, points: &[MetricPoint]) -> Resul
     let series_ids: Vec<i64> = points.iter().map(|p| p.series_id).collect();
     let timestamps: Vec<chrono::DateTime<chrono::Utc>> = points.iter().map(|p| p.ts).collect();
     let values: Vec<f64> = points.iter().map(|p| p.value).collect();
+    let exemplar_trace_ids: Vec<Option<&str>> =
+        points.iter().map(|p| p.exemplar_trace_id.as_deref()).collect();
+    let exemplar_span_ids: Vec<Option<&str>> =
+        points.iter().map(|p| p.exemplar_span_id.as_deref()).collect();
 
     sqlx::query(
         r#"
-        INSERT INTO soma_observe.metric_point (series_id, ts, value)
-        SELECT * FROM UNNEST($1::bigint[], $2::timestamptz[], $3::float8[])
+        INSERT INTO soma_observe.metric_point (series_id, ts, value, exemplar_trace_id, exemplar_span_id)
+        SELECT * FROM UNNEST(
+            $1::bigint[],
+            $2::timestamptz[],
+            $3::float8[],
+            $4::text[],
+            $5::text[]
+        )
         ON CONFLICT (series_id, ts) DO NOTHING
         "#,
     )
     .bind(&series_ids)
     .bind(&timestamps)
     .bind(&values)
+    .bind(&exemplar_trace_ids)
+    .bind(&exemplar_span_ids)
     .execute(pool)
     .await?;
 
@@ -218,6 +230,8 @@ mod tests {
             series_id,
             ts: Utc::now(),
             value,
+            exemplar_trace_id: None,
+            exemplar_span_id: None,
         }
     }
 
@@ -304,6 +318,8 @@ mod tests {
             series_id: sid,
             ts,
             value: 42.0,
+            exemplar_trace_id: None,
+            exemplar_span_id: None,
         }];
         write_metric_points(&db.pool, &pts)
             .await

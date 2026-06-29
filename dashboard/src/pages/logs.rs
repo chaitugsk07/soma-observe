@@ -4,6 +4,8 @@ use crate::api::{query_logs, LogRecord};
 use crate::app::AppCtx;
 use crate::util::relative_time;
 use leptos::prelude::*;
+use leptos_router::hooks::{use_navigate, use_query_map};
+use leptos_router::NavigateOptions;
 use soma_ui::{
     Alert, AlertDescription, AlertTitle, AlertVariant, Badge, BadgeVariant, Button, ButtonSize,
     ButtonVariant, Empty, Input, PageHeader, Select, SelectContent, SelectItem, Spinner, Table,
@@ -39,9 +41,17 @@ fn short_body(body: &str) -> String {
     }
 }
 
+/// Truncate a trace/span ID for display (first 16 hex chars).
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(16)]
+}
+
 #[component]
 pub fn LogsPage() -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("AppCtx required");
+
+    let query_map = use_query_map();
+    let navigate = use_navigate();
 
     let start_val = RwSignal::new(String::new());
     let end_val = RwSignal::new(String::new());
@@ -50,6 +60,10 @@ pub fn LogsPage() -> impl IntoView {
     let filter_val = RwSignal::new(String::new());
     let limit_val = RwSignal::new("100".to_string());
 
+    // Trace correlation filter (from query param or user-set)
+    let trace_id_filter: RwSignal<Option<String>> = RwSignal::new(None);
+    let span_id_filter: RwSignal<Option<String>> = RwSignal::new(None);
+
     let logs: RwSignal<Vec<LogRecord>> = RwSignal::new(vec![]);
     let loading = RwSignal::new(false);
     let err: RwSignal<Option<String>> = RwSignal::new(None);
@@ -57,7 +71,8 @@ pub fn LogsPage() -> impl IntoView {
 
     let token_sig = ctx.token;
 
-    let do_query = move |_| {
+    // Inner fn: run the logs query using current signal values.
+    let run_query = move || {
         let token = token_sig.get_untracked();
         let start = start_val.get_untracked();
         let end = end_val.get_untracked();
@@ -66,6 +81,8 @@ pub fn LogsPage() -> impl IntoView {
         let filter = filter_val.get_untracked();
         let limit_s = limit_val.get_untracked();
         let limit = limit_s.parse::<u32>().unwrap_or(100);
+        let tid = trace_id_filter.get_untracked();
+        let sid = span_id_filter.get_untracked();
 
         // Default: last 1h
         let (s, e) = if start.is_empty() {
@@ -88,6 +105,8 @@ pub fn LogsPage() -> impl IntoView {
                 if sev.is_empty() { None } else { Some(&sev) },
                 if q.is_empty() { None } else { Some(&q) },
                 Some(limit),
+                tid.as_deref(),
+                sid.as_deref(),
             )
             .await
             {
@@ -99,8 +118,30 @@ pub fn LogsPage() -> impl IntoView {
         });
     };
 
+    // On mount: pick up trace_id / span_id from URL query params and auto-run.
+    let run_query_for_effect = run_query.clone();
+    Effect::new(move |_| {
+        let params = query_map.get();
+        let tid = params.get("trace_id").filter(|s| !s.is_empty());
+        let sid = params.get("span_id").filter(|s| !s.is_empty());
+        if tid.is_some() {
+            trace_id_filter.set(tid);
+            span_id_filter.set(sid);
+            // Auto-run the query with this trace filter.
+            run_query_for_effect();
+        }
+    });
+
+    let do_query = move |_: web_sys::MouseEvent| run_query();
     // Refresh: same as do_query but reads current values
     let do_refresh = do_query;
+
+    let navigate_clear = navigate.clone();
+    let on_clear_filter = move |_| {
+        trace_id_filter.set(None);
+        span_id_filter.set(None);
+        navigate_clear("/logs", NavigateOptions::default());
+    };
 
     view! {
         <div class="space-y-6">
@@ -113,6 +154,24 @@ pub fn LogsPage() -> impl IntoView {
                     "Query"
                 </Button>
             </PageHeader>
+
+            // Trace correlation banner (shown when filtered by trace_id)
+            {move || trace_id_filter.get().map(|tid| {
+                let short = short_id(&tid).to_string();
+                view! {
+                    <div class="flex items-center gap-2 rounded-md border border-border bg-muted/50 px-3 py-2 text-sm">
+                        <span class="text-muted-foreground">"Filtered to trace"</span>
+                        <span class="font-mono text-xs">{short}</span>
+                        <button
+                            class="ml-auto text-muted-foreground hover:text-foreground"
+                            on:click=on_clear_filter.clone()
+                            title="Clear trace filter"
+                        >
+                            "\u{00d7}"
+                        </button>
+                    </div>
+                }
+            })}
 
             // Filters
             <div class="flex items-end gap-3 flex-wrap">
@@ -186,6 +245,7 @@ pub fn LogsPage() -> impl IntoView {
                     }.into_any();
                 }
                 let count = records.len();
+                let nav = navigate.clone();
                 view! {
                     <div class="space-y-3">
                         <p class="text-xs text-muted-foreground">{format!("{} records", count)}</p>
@@ -196,6 +256,7 @@ pub fn LogsPage() -> impl IntoView {
                                     <TableHead class="w-24".to_string()>"Severity"</TableHead>
                                     <TableHead>"Body"</TableHead>
                                     <TableHead class="w-32".to_string()>"Service"</TableHead>
+                                    <TableHead class="w-24".to_string()>"Trace"</TableHead>
                                 </TableRow>
                             </TableHeader>
                             <TableBody>
@@ -214,6 +275,8 @@ pub fn LogsPage() -> impl IntoView {
                                         let body = short_body(body_str);
                                         let full_body = rec.body.clone().unwrap_or_default();
                                         let service = service_from_resource(&rec.resource);
+                                        let rec_trace_id = rec.trace_id.clone();
+                                        let nav2 = nav.clone();
                                         view! {
                                             <TableRow>
                                                 <TableCell class="text-xs text-muted-foreground whitespace-nowrap".to_string()>
@@ -229,6 +292,21 @@ pub fn LogsPage() -> impl IntoView {
                                                 </TableCell>
                                                 <TableCell class="text-xs text-muted-foreground".to_string()>
                                                     {service}
+                                                </TableCell>
+                                                <TableCell class="text-xs".to_string()>
+                                                    {rec_trace_id.filter(|t| !t.is_empty()).map(|tid| {
+                                                        let href = format!("/traces?trace_id={}", tid);
+                                                        let nav3 = nav2.clone();
+                                                        view! {
+                                                            <button
+                                                                class="text-primary hover:underline font-mono"
+                                                                title=tid.clone()
+                                                                on:click=move |_| { nav3(&href, NavigateOptions::default()); }
+                                                            >
+                                                                "\u{2192} trace"
+                                                            </button>
+                                                        }
+                                                    })}
                                                 </TableCell>
                                             </TableRow>
                                         }

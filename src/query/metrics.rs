@@ -75,6 +75,10 @@ pub struct Point {
     /// Only set for count aggregation (scalar) or histogram series.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<i64>,
+    /// Representative exemplar trace_id (hex) for this bucket, if any was stored.
+    /// Absent for histogram series and scalar buckets with no exemplar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exemplar_trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -230,6 +234,7 @@ pub async fn query_metrics(
         bucket: DateTime<Utc>,
         value: Option<f64>,
         count: i64,
+        exemplar_trace_id: Option<String>,
     }
 
     // Build aggregate expression; for count, the "value" column holds the count.
@@ -249,7 +254,9 @@ pub async fn query_metrics(
                     'epoch'::timestamptz
                 ) AS bucket,
                 {agg_expr} AS agg_value,
-                COUNT(*) AS point_count
+                COUNT(*) AS point_count,
+                (array_agg(mp.exemplar_trace_id) FILTER (WHERE mp.exemplar_trace_id IS NOT NULL))[1]
+                    AS exemplar_trace_id
             FROM soma_observe.metric_point mp
             WHERE mp.series_id = ANY($2::bigint[])
               AND mp.ts >= $3
@@ -259,7 +266,7 @@ pub async fn query_metrics(
             "#,
             agg_expr = agg_expr,
         );
-        sqlx::query_as::<_, (i64, DateTime<Utc>, Option<f64>, i64)>(&sql)
+        sqlx::query_as::<_, (i64, DateTime<Utc>, Option<f64>, i64, Option<String>)>(&sql)
             .bind(step_secs as f64)
             .bind(&scalar_ids)
             .bind(start)
@@ -268,11 +275,12 @@ pub async fn query_metrics(
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|(series_id, bucket, value, count)| BucketRow {
+            .map(|(series_id, bucket, value, count, exemplar_trace_id)| BucketRow {
                 series_id,
                 bucket,
                 value,
                 count,
+                exemplar_trace_id,
             })
             .collect()
     };
@@ -384,6 +392,7 @@ pub async fn query_metrics(
                             end: bucket_end,
                             value: br.sum,
                             count: br.count,
+                            exemplar_trace_id: None,
                         }
                     })
                     .collect();
@@ -432,6 +441,7 @@ pub async fn query_metrics(
                                 end: bucket_end,
                                 value: Some(br.count as f64),
                                 count: Some(br.count),
+                                exemplar_trace_id: br.exemplar_trace_id.clone(),
                             }
                         } else {
                             Point {
@@ -439,6 +449,7 @@ pub async fn query_metrics(
                                 end: bucket_end,
                                 value: br.value,
                                 count: None,
+                                exemplar_trace_id: br.exemplar_trace_id.clone(),
                             }
                         }
                     })
@@ -1239,6 +1250,132 @@ mod tests {
         assert!(
             series_arr[0].get("histogram").is_none(),
             "scalar series must not have histogram field in JSON"
+        );
+    }
+
+    /// Helper: insert a scalar point with an exemplar trace_id directly.
+    async fn insert_point_with_exemplar(
+        pool: &sqlx::PgPool,
+        series_id: i64,
+        ts: DateTime<Utc>,
+        value: f64,
+        exemplar_trace_id: Option<&str>,
+        exemplar_span_id: Option<&str>,
+    ) {
+        use crate::store::schema::MetricPoint;
+        use crate::store::write::write_metric_points;
+        write_metric_points(
+            pool,
+            &[MetricPoint {
+                series_id,
+                ts,
+                value,
+                exemplar_trace_id: exemplar_trace_id.map(|s| s.to_string()),
+                exemplar_span_id: exemplar_span_id.map(|s| s.to_string()),
+            }],
+        )
+        .await
+        .expect("insert point with exemplar");
+    }
+
+    /// A scalar point stored with an exemplar trace_id is surfaced in the query response.
+    #[tokio::test]
+    async fn integration_scalar_point_with_exemplar() {
+        let Some(db) = test_db().await else {
+            eprintln!("SKIP integration_scalar_point_with_exemplar: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let metric = format!(
+            "exemplar.gauge.{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let sid = insert_series(&db.pool, &metric, "Gauge", &json!({}), &json!({})).await;
+
+        let raw_secs = (Utc::now() - Duration::minutes(5)).timestamp();
+        let aligned_secs = raw_secs - raw_secs.rem_euclid(120);
+        let base = chrono::DateTime::from_timestamp(aligned_secs, 0).unwrap();
+
+        let exemplar_tid = "aabbccddeeff00112233445566778899";
+        insert_point_with_exemplar(&db.pool, sid, base, 42.0, Some(exemplar_tid), Some("0102030405060708")).await;
+
+        let state = Arc::new(crate::state::AppState::new(db.pool.clone(), make_cfg()));
+        let start_str = (base - Duration::seconds(1)).to_rfc3339();
+        let end_str = (base + Duration::minutes(5)).to_rfc3339();
+
+        let resp = query_metrics(
+            State(state),
+            Query(MetricsQueryParams {
+                name: metric.clone(),
+                start: start_str,
+                end: end_str,
+                step: Some(120),
+                filter: None,
+                agg: Some("avg".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let parsed: MetricsQueryResponse = serde_json::from_slice(&body).expect("parse");
+        assert!(!parsed.series.is_empty(), "must return series");
+        assert!(!parsed.series[0].points.is_empty(), "must have points");
+
+        let pt = &parsed.series[0].points[0];
+        assert_eq!(
+            pt.exemplar_trace_id.as_deref(),
+            Some(exemplar_tid),
+            "exemplar_trace_id must match what was stored"
+        );
+    }
+
+    /// A scalar point stored WITHOUT an exemplar returns no exemplar_trace_id field.
+    #[tokio::test]
+    async fn integration_scalar_point_without_exemplar() {
+        let Some(db) = test_db().await else {
+            eprintln!("SKIP integration_scalar_point_without_exemplar: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let metric = format!(
+            "no.exemplar.gauge.{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let sid = insert_series(&db.pool, &metric, "Gauge", &json!({}), &json!({})).await;
+
+        let raw_secs = (Utc::now() - Duration::minutes(5)).timestamp();
+        let aligned_secs = raw_secs - raw_secs.rem_euclid(120);
+        let base = chrono::DateTime::from_timestamp(aligned_secs, 0).unwrap();
+
+        insert_point_with_exemplar(&db.pool, sid, base, 7.0, None, None).await;
+
+        let state = Arc::new(crate::state::AppState::new(db.pool.clone(), make_cfg()));
+        let start_str = (base - Duration::seconds(1)).to_rfc3339();
+        let end_str = (base + Duration::minutes(5)).to_rfc3339();
+
+        let resp = query_metrics(
+            State(state),
+            Query(MetricsQueryParams {
+                name: metric.clone(),
+                start: start_str,
+                end: end_str,
+                step: Some(120),
+                filter: None,
+                agg: Some("avg".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        // Check JSON: exemplar_trace_id key must be absent (skip_serializing_if).
+        let raw: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        let pts = raw["series"][0]["points"].as_array().expect("points array");
+        assert!(!pts.is_empty(), "must have points");
+        assert!(
+            pts[0].get("exemplar_trace_id").is_none(),
+            "exemplar_trace_id must be absent from JSON when None"
         );
     }
 }

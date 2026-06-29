@@ -111,6 +111,9 @@ pub struct MetricPoint {
     pub end: String,
     pub value: Option<f64>,
     pub count: Option<i64>,
+    /// Representative exemplar trace_id for this bucket, if any was stored.
+    #[serde(default)]
+    pub exemplar_trace_id: Option<String>,
 }
 
 /// Populated only for kind=Histogram series; absent for scalar series.
@@ -269,6 +272,8 @@ pub async fn query_logs(
     severity_min: Option<&str>,
     q: Option<&str>,
     limit: Option<u32>,
+    trace_id: Option<&str>,
+    span_id: Option<&str>,
 ) -> Result<Vec<LogRecord>, ApiError> {
     let mut url = "/api/v1/logs/query?".to_string();
     let mut first = true;
@@ -308,6 +313,16 @@ pub async fn query_logs(
     }
     if let Some(n) = limit {
         push("limit", &n.to_string());
+    }
+    if let Some(v) = trace_id {
+        if !v.is_empty() {
+            push("trace_id", v);
+        }
+    }
+    if let Some(v) = span_id {
+        if !v.is_empty() {
+            push("span_id", v);
+        }
     }
 
     let mut req = gloo_net::http::Request::get(&url);

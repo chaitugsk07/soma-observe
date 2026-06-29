@@ -28,6 +28,10 @@ pub struct LogsQueryParams {
     pub q: Option<String>,
     /// Maximum number of records to return. Default: 100. Max: 1000.
     pub limit: Option<i64>,
+    /// Filter by trace_id (exact match). Used for logs↔traces cross-signal pivot.
+    pub trace_id: Option<String>,
+    /// Filter by span_id (exact match). Used for logs↔traces cross-signal pivot.
+    pub span_id: Option<String>,
 }
 
 // ── Response type ─────────────────────────────────────────────────────────────
@@ -99,8 +103,10 @@ pub async fn query_logs(
           AND ($3::int4 IS NULL OR severity_number >= $3)
           AND ($4::text IS NULL OR body ILIKE '%' || $4 || '%')
           AND ($5::jsonb IS NULL OR attributes @> $5)
+          AND ($6::text IS NULL OR trace_id = $6)
+          AND ($7::text IS NULL OR span_id = $7)
         ORDER BY ts DESC
-        LIMIT $6
+        LIMIT $8
     "#;
 
     // Type alias keeps the tuple readable and satisfies the clippy::type_complexity lint.
@@ -122,6 +128,8 @@ pub async fn query_logs(
         .bind(params.severity_min)
         .bind(params.q.as_deref())
         .bind(attr_filter.as_ref())
+        .bind(params.trace_id.as_deref())
+        .bind(params.span_id.as_deref())
         .bind(limit)
         .fetch_all(&state.pool)
         .await
@@ -217,17 +225,35 @@ mod tests {
         resource: &Value,
         attributes: &Value,
     ) {
+        seed_log_with_trace(pool, ts, severity_number, severity_text, body, None, None, resource, attributes).await;
+    }
+
+    /// Seed a log record with optional trace_id and span_id.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_log_with_trace(
+        pool: &sqlx::PgPool,
+        ts: DateTime<Utc>,
+        severity_number: Option<i32>,
+        severity_text: Option<&str>,
+        body: Option<&str>,
+        trace_id: Option<&str>,
+        span_id: Option<&str>,
+        resource: &Value,
+        attributes: &Value,
+    ) {
         sqlx::query(
             r#"
             INSERT INTO soma_observe.logs
-                (ts, severity_number, severity_text, body, resource, attributes)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                (ts, severity_number, severity_text, body, trace_id, span_id, resource, attributes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
         .bind(ts)
         .bind(severity_number)
         .bind(severity_text)
         .bind(body)
+        .bind(trace_id)
+        .bind(span_id)
         .bind(resource)
         .bind(attributes)
         .execute(pool)
@@ -297,6 +323,8 @@ mod tests {
                 severity_min: None,
                 q: Some(tag.clone()),
                 limit: Some(50),
+                trace_id: None,
+                span_id: None,
             }),
         )
         .await;
@@ -372,6 +400,8 @@ mod tests {
                 severity_min: Some(9),
                 q: None,
                 limit: Some(50),
+                trace_id: None,
+                span_id: None,
             }),
         )
         .await;
@@ -452,6 +482,8 @@ mod tests {
                 severity_min: None,
                 q: Some("payment".to_string()),
                 limit: Some(50),
+                trace_id: None,
+                span_id: None,
             }),
         )
         .await;
@@ -513,6 +545,8 @@ mod tests {
                 severity_min: None,
                 q: None,
                 limit: Some(50),
+                trace_id: None,
+                span_id: None,
             }),
         )
         .await;
@@ -566,6 +600,8 @@ mod tests {
                 severity_min: None,
                 q: None,
                 limit: Some(3),
+                trace_id: None,
+                span_id: None,
             }),
         )
         .await;
@@ -577,5 +613,161 @@ mod tests {
         let body_str = String::from_utf8(body_bytes.to_vec()).expect("utf8");
         let lines: Vec<&str> = body_str.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 3, "limit=3 must cap results at 3");
+    }
+
+    /// trace_id filter returns only logs with that trace_id.
+    #[tokio::test]
+    async fn integration_logs_trace_id_filter() {
+        let Some(db) = test_db().await else {
+            eprintln!("SKIP integration_logs_trace_id_filter: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let base = Utc::now().checked_sub_signed(Duration::minutes(5)).unwrap();
+        let target_trace = "aabbccddeeff00112233445566778899";
+        let other_trace = "1111111111111111111111111111111a";
+
+        seed_log_with_trace(
+            &db.pool,
+            base,
+            Some(9),
+            Some("INFO"),
+            Some("log with target trace"),
+            Some(target_trace),
+            Some("0102030405060708"),
+            &json!({}),
+            &json!({}),
+        )
+        .await;
+        seed_log_with_trace(
+            &db.pool,
+            base + Duration::seconds(1),
+            Some(9),
+            Some("INFO"),
+            Some("log with other trace"),
+            Some(other_trace),
+            None,
+            &json!({}),
+            &json!({}),
+        )
+        .await;
+        seed_log(
+            &db.pool,
+            base + Duration::seconds(2),
+            Some(9),
+            Some("INFO"),
+            Some("log without trace"),
+            &json!({}),
+            &json!({}),
+        )
+        .await;
+
+        let state = Arc::new(crate::state::AppState::new(db.pool.clone(), make_cfg()));
+        let start_str = (base - Duration::seconds(1)).to_rfc3339();
+        let end_str = (base + Duration::minutes(2)).to_rfc3339();
+
+        // Filter by target_trace → only one log.
+        let resp = query_logs(
+            State(state.clone()),
+            Query(LogsQueryParams {
+                start: start_str.clone(),
+                end: end_str.clone(),
+                filter: None,
+                severity_min: None,
+                q: None,
+                limit: Some(50),
+                trace_id: Some(target_trace.to_string()),
+                span_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let lines: Vec<&str> = std::str::from_utf8(&body).unwrap().lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "trace_id filter must return only matching log");
+        let entry: LogEntry = serde_json::from_str(lines[0]).expect("parse");
+        assert_eq!(entry.trace_id.as_deref(), Some(target_trace));
+
+        // Filter by non-matching trace_id → empty.
+        let resp = query_logs(
+            State(state),
+            Query(LogsQueryParams {
+                start: start_str,
+                end: end_str,
+                filter: None,
+                severity_min: None,
+                q: None,
+                limit: Some(50),
+                trace_id: Some("deadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+                span_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let lines: Vec<&str> = std::str::from_utf8(&body).unwrap().lines().filter(|l| !l.is_empty()).collect();
+        assert!(lines.is_empty(), "non-matching trace_id must return empty");
+    }
+
+    /// span_id filter returns only logs with that span_id.
+    #[tokio::test]
+    async fn integration_logs_span_id_filter() {
+        let Some(db) = test_db().await else {
+            eprintln!("SKIP integration_logs_span_id_filter: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let base = Utc::now().checked_sub_signed(Duration::minutes(5)).unwrap();
+        let target_span = "aabbccdd11223344";
+
+        seed_log_with_trace(
+            &db.pool,
+            base,
+            Some(9),
+            Some("INFO"),
+            Some("log with target span"),
+            Some("ffffffffffffffffffffffffffffffff"),
+            Some(target_span),
+            &json!({}),
+            &json!({}),
+        )
+        .await;
+        seed_log_with_trace(
+            &db.pool,
+            base + Duration::seconds(1),
+            Some(9),
+            Some("INFO"),
+            Some("log with different span"),
+            Some("ffffffffffffffffffffffffffffffff"),
+            Some("9988776655443322"),
+            &json!({}),
+            &json!({}),
+        )
+        .await;
+
+        let state = Arc::new(crate::state::AppState::new(db.pool.clone(), make_cfg()));
+        let start_str = (base - Duration::seconds(1)).to_rfc3339();
+        let end_str = (base + Duration::minutes(2)).to_rfc3339();
+
+        let resp = query_logs(
+            State(state),
+            Query(LogsQueryParams {
+                start: start_str,
+                end: end_str,
+                filter: None,
+                severity_min: None,
+                q: None,
+                limit: Some(50),
+                trace_id: None,
+                span_id: Some(target_span.to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let lines: Vec<&str> = std::str::from_utf8(&body).unwrap().lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "span_id filter must return only matching log");
+        let entry: LogEntry = serde_json::from_str(lines[0]).expect("parse");
+        assert_eq!(entry.span_id.as_deref(), Some(target_span));
     }
 }

@@ -4,6 +4,8 @@ use crate::api::{get_trace, query_traces, SpanDetail, TraceSummary};
 use crate::app::AppCtx;
 use crate::util::relative_time;
 use leptos::prelude::*;
+use leptos_router::hooks::{use_navigate, use_query_map};
+use leptos_router::NavigateOptions;
 use soma_ui::{
     Alert, AlertDescription, AlertTitle, AlertVariant, Badge, BadgeVariant, Button, ButtonSize,
     ButtonVariant, Card, CardContent, CardHeader, CardTitle, Empty, Input, PageHeader, Select,
@@ -222,6 +224,9 @@ fn Waterfall(spans: Vec<SpanDetail>) -> impl IntoView {
 pub fn TracesPage() -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("AppCtx required");
 
+    let query_map = use_query_map();
+    let navigate = use_navigate();
+
     // Filter signals
     let service_val = RwSignal::new(String::new());
     let name_val = RwSignal::new(String::new());
@@ -294,8 +299,8 @@ pub fn TracesPage() -> impl IntoView {
         });
     };
 
-    // Load spans when a trace row is clicked.
-    let on_row_click = move |trace_id: String| {
+    // Load spans when a trace row is clicked (or deep-linked).
+    let load_spans = move |trace_id: String| {
         let token = token_sig.get_untracked();
         selected_trace_id.set(Some(trace_id.clone()));
         spans_loading.set(true);
@@ -310,6 +315,16 @@ pub fn TracesPage() -> impl IntoView {
             spans_loading.set(false);
         });
     };
+
+    let on_row_click = load_spans.clone();
+
+    // On mount: if ?trace_id=<id> is present, auto-open that trace's waterfall.
+    Effect::new(move |_| {
+        let params = query_map.get();
+        if let Some(tid) = params.get("trace_id").filter(|s| !s.is_empty()) {
+            load_spans(tid);
+        }
+    });
 
     view! {
         <div class="space-y-6">
@@ -478,12 +493,24 @@ pub fn TracesPage() -> impl IntoView {
                 let Some(tid) = selected_trace_id.get() else {
                     return ().into_any();
                 };
+                let logs_href = format!("/logs?trace_id={}", tid);
+                let short_tid = tid[..tid.len().min(16)].to_string();
+                let nav = navigate.clone();
                 view! {
                     <Card>
                         <CardHeader>
-                            <CardTitle>
-                                {format!("Trace {}", &tid[..tid.len().min(16)])}
-                            </CardTitle>
+                            <div class="flex items-center justify-between">
+                                <CardTitle>
+                                    {format!("Trace {}", short_tid)}
+                                </CardTitle>
+                                <Button
+                                    variant=ButtonVariant::Outline
+                                    size=ButtonSize::Sm
+                                    on:click=move |_| { nav(&logs_href, NavigateOptions::default()); }
+                                >
+                                    "\u{2192} logs"
+                                </Button>
+                            </div>
                         </CardHeader>
                         <CardContent>
                             {move || {

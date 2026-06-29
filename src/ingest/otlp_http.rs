@@ -175,12 +175,36 @@ fn service_unavailable() -> Response {
 ///
 /// Handles:
 /// - `resourceMetrics[*].scopeMetrics[*].metrics[*].histogram.dataPoints[*].{count,bucketCounts}`
+/// - `resourceMetrics[*].scopeMetrics[*].metrics[*].{gauge|sum|histogram}.dataPoints[*].exemplars[*].timeUnixNano`
 /// - `resourceSpans[*].scopeSpans[*].spans[*].{startTimeUnixNano,endTimeUnixNano}`
 ///
 /// Malformed / missing fields are skipped; the normal serde path handles them.
 fn normalize_otlp_json(body: &[u8]) -> Result<Vec<u8>, String> {
     let mut root: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("json parse: {e}"))?;
+
+    // Normalize exemplars[*].timeUnixNano: string → number within a dataPoints array.
+    //
+    // Root cause: Exemplar.time_unix_nano has no custom serde deserializer (unlike
+    // NumberDataPoint.time_unix_nano which uses deserialize_string_to_u64).  The
+    // OTLP/JSON spec encodes it as a string; the struct expects a plain u64.
+    // Converting here keeps the datapoint from being dropped by the "None data" guard.
+    fn normalize_exemplars(dps: &mut [serde_json::Value]) {
+        for dp in dps {
+            if let Some(exemplars) = dp.get_mut("exemplars").and_then(|v| v.as_array_mut()) {
+                for ex in exemplars {
+                    // timeUnixNano: string → number (Exemplar lacks the custom string deserializer)
+                    if let Some(n) = ex
+                        .get("timeUnixNano")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        ex["timeUnixNano"] = serde_json::Value::from(n);
+                    }
+                }
+            }
+        }
+    }
 
     // Walk resourceMetrics[*].scopeMetrics[*].metrics[*].histogram.dataPoints[*]
     if let Some(rms) = root
@@ -197,12 +221,13 @@ fn normalize_otlp_json(body: &[u8]) -> Result<Vec<u8>, String> {
                         sm.get_mut("metrics").and_then(|v| v.as_array_mut())
                     {
                         for metric in metrics {
+                            // Histogram: count, bucketCounts, and exemplars
                             if let Some(dps) = metric
                                 .get_mut("histogram")
                                 .and_then(|h| h.get_mut("dataPoints"))
                                 .and_then(|v| v.as_array_mut())
                             {
-                                for dp in dps {
+                                for dp in dps.iter_mut() {
                                     // count: string → number
                                     if let Some(s) = dp
                                         .get("count")
@@ -225,6 +250,17 @@ fn normalize_otlp_json(body: &[u8]) -> Result<Vec<u8>, String> {
                                             }
                                         }
                                     }
+                                }
+                                normalize_exemplars(dps);
+                            }
+                            // Gauge and Sum: exemplars only
+                            for kind in ["gauge", "sum"] {
+                                if let Some(dps) = metric
+                                    .get_mut(kind)
+                                    .and_then(|g| g.get_mut("dataPoints"))
+                                    .and_then(|v| v.as_array_mut())
+                                {
+                                    normalize_exemplars(dps);
                                 }
                             }
                         }
@@ -341,6 +377,27 @@ fn status_code_text(code: i32) -> Option<String> {
 /// Check whether bytes are all-zero (OTLP unset id).
 fn bytes_are_zero(b: &[u8]) -> bool {
     b.is_empty() || b.iter().all(|&x| x == 0)
+}
+
+/// Extract the first exemplar with a non-empty trace_id from a NumberDataPoint's
+/// exemplar list. Returns (exemplar_trace_id, exemplar_span_id) as hex strings.
+///
+/// ponytail: only one exemplar per point stored — the first with a valid trace_id.
+fn extract_exemplar(
+    exemplars: &[opentelemetry_proto::tonic::metrics::v1::Exemplar],
+) -> (Option<String>, Option<String>) {
+    for ex in exemplars {
+        if !bytes_are_zero(&ex.trace_id) {
+            let trace_id = Some(bytes_to_hex(&ex.trace_id));
+            let span_id = if bytes_are_zero(&ex.span_id) {
+                None
+            } else {
+                Some(bytes_to_hex(&ex.span_id))
+            };
+            return (trace_id, span_id);
+        }
+    }
+    (None, None)
 }
 
 /// Respond to CORS OPTIONS preflight for ingest routes.
@@ -464,10 +521,14 @@ pub async fn ingest_metrics(State(state): State<Arc<AppState>>, request: Request
                                     continue;
                                 }
                             };
+                            let (exemplar_trace_id, exemplar_span_id) =
+                                extract_exemplar(&dp.exemplars);
                             metric_points.push(MetricPoint {
                                 series_id,
                                 ts,
                                 value,
+                                exemplar_trace_id,
+                                exemplar_span_id,
                             });
                         }
                     }
@@ -555,10 +616,14 @@ pub async fn ingest_metrics(State(state): State<Arc<AppState>>, request: Request
                                 cumulative_value
                             };
 
+                            let (exemplar_trace_id, exemplar_span_id) =
+                                extract_exemplar(&dp.exemplars);
                             metric_points.push(MetricPoint {
                                 series_id,
                                 ts,
                                 value: delta_value,
+                                exemplar_trace_id,
+                                exemplar_span_id,
                             });
                         }
                     }
@@ -1632,6 +1697,51 @@ mod tests {
             "bucket_counts must be [1, 2] (not empty)"
         );
         assert_ne!(point.time_unix_nano, 0, "time_unix_nano must be non-zero");
+    }
+
+    /// Regression test: OTLP/JSON gauge datapoint with an `exemplars` array containing a
+    /// string-encoded `timeUnixNano` must decode without rejecting the datapoint, and the
+    /// exemplar's traceId must be captured.
+    ///
+    /// Root cause: `Exemplar.time_unix_nano` in opentelemetry-proto 0.28 has no custom
+    /// string-to-u64 serde deserializer (unlike `NumberDataPoint.time_unix_nano`).  The
+    /// OTLP/JSON spec encodes it as a string, causing a decode error that bubbles up and
+    /// makes the enclosing `metric.data` oneof deserialize to `None`, triggering the
+    /// "unrecognized or empty metric data" rejection path.  `normalize_otlp_json` now
+    /// converts `exemplars[*].timeUnixNano` from string to number before serde runs.
+    #[test]
+    fn test_decode_json_gauge_with_exemplar() {
+        use axum::http::HeaderValue;
+
+        let trace_id = "aabbccddeeff00112233445566778899";
+        let span_id = "0102030405060708";
+        // Mimic what real OTel SDKs send: timeUnixNano as a quoted string.
+        let payload = format!(
+            r#"{{"resourceMetrics":[{{"scopeMetrics":[{{"metrics":[{{"name":"ex.gauge","gauge":{{"dataPoints":[{{"asDouble":99.5,"timeUnixNano":"1700000000000000000","exemplars":[{{"timeUnixNano":"1700000000000000000","asDouble":99.5,"traceId":"{trace_id}","spanId":"{span_id}","filteredAttributes":[]}}]}}]}}}}]}}]}}]}}"#
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let body = Bytes::from(payload.into_bytes());
+
+        let req = decode_metrics(&headers, &body).expect("decode_metrics must not fail on gauge-with-exemplar");
+        let dp = &req.resource_metrics[0].scope_metrics[0].metrics[0];
+        // The gauge data must be present — not None.
+        let gauge = match dp.data.as_ref().expect("data must be Some, not None") {
+            opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(g) => g,
+            other => panic!("expected Gauge, got {:?}", other),
+        };
+        let point = &gauge.data_points[0];
+        assert_eq!(point.exemplars.len(), 1, "exemplar must be decoded");
+        let (ex_trace_id, _ex_span_id) = extract_exemplar(&point.exemplars);
+        assert_eq!(
+            ex_trace_id.as_deref(),
+            Some(trace_id),
+            "exemplar_trace_id must equal the sent traceId hex string"
+        );
     }
 
     /// End-to-end test: ingest a gauge via the handler, then query it back via the

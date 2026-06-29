@@ -18,6 +18,10 @@ pub struct MetricPoint {
     pub series_id: i64,
     pub ts: chrono::DateTime<chrono::Utc>,
     pub value: f64,
+    /// Optional exemplar: a representative trace_id sampled at measurement time.
+    pub exemplar_trace_id: Option<String>,
+    /// Optional exemplar: span_id paired with exemplar_trace_id.
+    pub exemplar_span_id: Option<String>,
 }
 
 /// A histogram data point.
