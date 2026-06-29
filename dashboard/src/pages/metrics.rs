@@ -1,13 +1,13 @@
 //! Metrics page — browse metric names, series, and plot time-series data.
 
-use crate::api::{query_metrics, get_metric_names, get_metric_series, MetricPoint, MetricSeries};
+use crate::api::{query_metrics, get_metric_names, get_metric_series, HistogramSummary, MetricPoint, MetricSeries};
 use crate::app::AppCtx;
 use leptos::prelude::*;
 use soma_ui::{
-    Alert, AlertDescription, AlertTitle, AlertVariant, Badge, BadgeVariant, Button, ButtonSize,
-    ButtonVariant, Column, DataTable, Empty, Input, LineChart, LineVariant, PageHeader, Select,
-    SelectContent, SelectItem, Spinner, Table, TableBody, TableCell, TableHead, TableHeader,
-    TableRow,
+    Alert, AlertDescription, AlertTitle, AlertVariant, Badge, BadgeVariant, BarChart, BarVariant,
+    Button, ButtonSize, ButtonVariant, Column, DataTable, Empty, Input, LineChart, LineVariant,
+    PageHeader, Select, SelectContent, SelectItem, Spinner, Table, TableBody, TableCell,
+    TableHead, TableHeader, TableRow,
 };
 use soma_ui::ChartPoint;
 use soma_ui::ChartSeries;
@@ -107,6 +107,8 @@ pub fn MetricsPage() -> impl IntoView {
     let chart_series: RwSignal<Vec<ChartSeries>> = RwSignal::new(vec![]);
     let raw_points: RwSignal<Vec<(String, Vec<MetricPoint>)>> = RwSignal::new(vec![]);
     let query_unit = RwSignal::new(String::new());
+    let query_kind = RwSignal::new(String::new());
+    let histogram_data: RwSignal<Option<HistogramSummary>> = RwSignal::new(None);
     let query_loading = RwSignal::new(false);
     let query_err: RwSignal<Option<String>> = RwSignal::new(None);
     let query_done = RwSignal::new(false);
@@ -149,21 +151,49 @@ pub fn MetricsPage() -> impl IntoView {
             {
                 Ok(resp) => {
                     query_unit.set(resp.unit.clone().unwrap_or_default());
-                    // Build chart series (cap at 6)
+                    // Capture kind + histogram from the first series.
+                    let first_kind = resp.series.first().map(|s| s.kind.clone()).unwrap_or_default();
+                    let first_hist = resp.series.first().and_then(|s| s.histogram.clone());
+                    query_kind.set(first_kind.clone());
+                    histogram_data.set(first_hist);
+
+                    // Build chart series (cap at 6).
+                    // For Histogram: emit two series — count and sum (value).
                     let capped: Vec<_> = resp.series.iter().take(6).collect();
-                    let cs: Vec<ChartSeries> = capped
-                        .iter()
-                        .map(|qs| ChartSeries {
-                            points: qs
-                                .points
-                                .iter()
-                                .map(|p| ChartPoint {
+                    let cs: Vec<ChartSeries> = if first_kind == "Histogram" {
+                        // Two series for the first series only: count and sum.
+                        if let Some(qs) = capped.first() {
+                            let count_series = ChartSeries {
+                                points: qs.points.iter().map(|p| ChartPoint {
+                                    label: short_ts(&p.start),
+                                    value: p.count.unwrap_or(0) as f64,
+                                }).collect(),
+                            };
+                            let sum_series = ChartSeries {
+                                points: qs.points.iter().map(|p| ChartPoint {
                                     label: short_ts(&p.start),
                                     value: p.value.unwrap_or(0.0),
-                                })
-                                .collect(),
-                        })
-                        .collect();
+                                }).collect(),
+                            };
+                            vec![count_series, sum_series]
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        capped
+                            .iter()
+                            .map(|qs| ChartSeries {
+                                points: qs
+                                    .points
+                                    .iter()
+                                    .map(|p| ChartPoint {
+                                        label: short_ts(&p.start),
+                                        value: p.value.unwrap_or(0.0),
+                                    })
+                                    .collect(),
+                            })
+                            .collect()
+                    };
                     chart_series.set(cs);
                     // raw points for table: flatten with series label
                     let rp: Vec<(String, Vec<MetricPoint>)> = resp
@@ -292,19 +322,32 @@ pub fn MetricsPage() -> impl IntoView {
                     }.into_any();
                 }
                 let unit = query_unit.get();
+                let kind = query_kind.get();
+                let is_histogram = kind == "Histogram";
                 let total_series = raw_points.get().len();
-                let capped = total_series > 6;
+                let capped = !is_histogram && total_series > 6;
+                let hist = histogram_data.get();
                 view! {
                     <div class="space-y-4">
                         <div class="rounded-lg border border-border bg-card p-4">
                             <div class="flex items-center justify-between mb-2">
-                                <span class="text-sm font-medium text-foreground">
-                                    {move || selected_name.get()}
-                                </span>
+                                <div class="flex items-center gap-2">
+                                    <span class="text-sm font-medium text-foreground">
+                                        {move || selected_name.get()}
+                                    </span>
+                                    {(!kind.is_empty()).then(|| view! {
+                                        <Badge variant=BadgeVariant::Secondary>{kind.clone()}</Badge>
+                                    })}
+                                </div>
                                 {(!unit.is_empty()).then(|| view! {
                                     <Badge variant=BadgeVariant::Secondary>{unit.clone()}</Badge>
                                 })}
                             </div>
+                            {is_histogram.then(|| view! {
+                                <p class="text-xs text-muted-foreground mb-2">
+                                    "count (blue) · sum (orange) over time"
+                                </p>
+                            })}
                             {capped.then(|| view! {
                                 <p class="text-xs text-muted-foreground mb-2">
                                     {format!("Showing 6 of {} series", total_series)}
@@ -316,6 +359,32 @@ pub fn MetricsPage() -> impl IntoView {
                                 series=cs
                             />
                         </div>
+
+                        // Histogram bucket distribution (only for Histogram kind)
+                        {hist.map(|h| {
+                            // Build bucket labels: N bounds → N+1 bars; last label is "+Inf".
+                            let bar_points: Vec<ChartPoint> = h.latest_bucket_counts
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &cnt)| {
+                                    let label = if i < h.bounds.len() {
+                                        format!("≤{}", h.bounds[i])
+                                    } else {
+                                        "+Inf".to_string()
+                                    };
+                                    ChartPoint { label, value: cnt as f64 }
+                                })
+                                .collect();
+                            view! {
+                                <div class="rounded-lg border border-border bg-card p-4">
+                                    <p class="text-sm font-medium text-foreground mb-2">"Latest bucket distribution"</p>
+                                    <BarChart
+                                        data=bar_points
+                                        variant=BarVariant::Default
+                                    />
+                                </div>
+                            }
+                        })}
 
                         // Raw points table
                         <div class="space-y-3">

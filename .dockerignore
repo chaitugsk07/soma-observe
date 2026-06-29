@@ -1,0 +1,20 @@
+# Exclude build artifacts and large target directories from the Docker build context.
+# This dramatically reduces context size when building from the soma-platform/ parent dir.
+
+soma-observe/target/
+soma-observe/dashboard/target/
+soma-observe/dashboard/dist/
+soma-infra/target/
+soma-schema/target/
+soma-ui/node_modules/
+soma-ui/**/node_modules/
+soma-ui/target/
+
+# Git histories are not needed inside the image.
+**/.git/
+**/.gitignore
+
+# Local dev / editor artifacts.
+**/.DS_Store
+**/.env
+**/target/

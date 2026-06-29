@@ -1,0 +1,230 @@
+# CI pipeline for soma-observe
+#
+# MAINTAINER CHECKLIST — verify before this workflow is reliable:
+#
+# 1. SIBLING REPOS: This workflow checks out three sibling repos alongside
+#    soma-observe so path dependencies resolve on the runner:
+#      - chaitugsk07/soma-schema  → placed at ../soma-schema
+#      - chaitugsk07/soma-infra   → placed at ../soma-infra
+#      - chaitugsk07/soma-ui      → placed at ../soma-ui  (dashboard job only)
+#    Confirm these GitHub repo names are correct.
+#
+# 2. PRIVATE REPOS: If any sibling repo is private, the `actions/checkout`
+#    step for it will fail with a 404. Add a GitHub Personal Access Token (PAT)
+#    or a deploy key, then pass it via:
+#      token: ${{ secrets.SOMA_INFRA_READ_TOKEN }}
+#    (or a shared bot token scoped to the relevant repos).
+#    Create the secret under Settings → Secrets and variables → Actions.
+#
+# 3. SIBLING REF: Steps below check out `main`. Adjust the `ref:` field
+#    if the default branch is named differently.
+#
+# 4. DATABASE URL: The Postgres service credentials below are baked in for CI.
+#    They are NOT secrets — they are ephemeral per-job containers. No changes
+#    needed unless you want a different DB name.
+#
+# 5. TRUNK BUILD BEFORE CARGO: dashboard/dist/ is gitignored. The `test` job
+#    installs trunk and builds the dashboard BEFORE `cargo build` so that
+#    rust-embed (portal.rs) compiles successfully. Do not reorder these steps.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1 — fmt, clippy, build, test
+  # ---------------------------------------------------------------------------
+  test:
+    name: test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: postgres
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      # 1. Check out soma-observe (this repo).
+      - name: Checkout soma-observe
+        uses: actions/checkout@v4
+        with:
+          path: soma-observe
+
+      # 2. Check out soma-schema as a sibling so `path = "../soma-schema"` resolves.
+      #    MAINTAINER: if soma-schema is private, add:  token: ${{ secrets.SOMA_SCHEMA_READ_TOKEN }}
+      - name: Checkout soma-schema (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-schema
+          ref: main
+          path: soma-schema
+          # token: ${{ secrets.SOMA_SCHEMA_READ_TOKEN }}
+
+      # 3. Check out soma-infra as a sibling so `path = "../soma-infra"` resolves.
+      #    soma-observe depends on soma-infra for db/tracing/signal/config/testing.
+      #    MAINTAINER: if soma-infra is private, add:  token: ${{ secrets.SOMA_INFRA_READ_TOKEN }}
+      - name: Checkout soma-infra (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-infra
+          ref: main
+          path: soma-infra
+          # token: ${{ secrets.SOMA_INFRA_READ_TOKEN }}
+
+      # 4. Install Rust stable with clippy + rustfmt.
+      #    wasm32 target is added in this job because rust-embed requires the
+      #    dashboard/dist/ to exist before cargo compiles portal.rs.
+      - name: Install Rust stable + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      # 5. Cache Cargo registry + build artefacts.
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: soma-observe
+
+      # 6. Install trunk (Leptos build tool) — required to populate dashboard/dist/
+      #    before cargo compiles portal.rs (rust-embed fails without the dist dir).
+      - name: Install trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      # 7. Check out soma-ui so the dashboard's path dep resolves during trunk build.
+      #    MAINTAINER: if soma-ui is private, add:  token: ${{ secrets.SOMA_UI_READ_TOKEN }}
+      - name: Checkout soma-ui (dashboard path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-ui
+          ref: main
+          path: soma-ui
+          # token: ${{ secrets.SOMA_UI_READ_TOKEN }}
+
+      # 8. Build the dashboard with trunk BEFORE cargo so rust-embed finds dist/.
+      #    This is critical — do not move this step after cargo fmt/clippy/build.
+      - name: trunk build (dashboard — must run before cargo)
+        working-directory: soma-observe/dashboard
+        run: trunk build --release
+
+      # 9. Format check.
+      - name: cargo fmt --check
+        working-directory: soma-observe
+        run: cargo fmt --all --check
+
+      # 10. Clippy (all targets, deny warnings).
+      - name: cargo clippy
+        working-directory: soma-observe
+        run: cargo clippy --all-targets -- -D warnings
+
+      # 11. Build.
+      - name: cargo build
+        working-directory: soma-observe
+        run: cargo build
+
+      # 12. Run tests with a live Postgres so DB integration tests execute.
+      #     TEST_DATABASE_URL matches the service container above (port 5433).
+      #     Tests create isolated soma_test_* databases via soma_infra::TestDb.
+      - name: cargo test
+        working-directory: soma-observe
+        env:
+          TEST_DATABASE_URL: postgres://postgres:secret@localhost:5433/postgres
+          RUST_TEST_THREADS: "1"
+        run: cargo test -- --test-threads=1
+
+  # ---------------------------------------------------------------------------
+  # Job 2 — Leptos dashboard (wasm32 compile via trunk)
+  #
+  # The dashboard has sibling path deps:
+  #   soma-infra  → ../soma-infra  (relative to soma-observe/)
+  #   soma-schema → ../soma-schema
+  #   soma-ui     → ../../soma-ui  (relative to dashboard/, i.e. ../soma-ui from root)
+  #
+  # MAINTAINER: if soma-ui is private, add a token to its checkout step.
+  # ---------------------------------------------------------------------------
+  dashboard:
+    name: dashboard
+    runs-on: ubuntu-latest
+    # Best-effort until dashboard builds reliably in CI.
+    # Remove once soma-ui checkout and trunk build are stable.
+    continue-on-error: true
+
+    steps:
+      # 1. Check out soma-observe.
+      - name: Checkout soma-observe
+        uses: actions/checkout@v4
+        with:
+          path: soma-observe
+
+      # 2. Check out soma-schema.
+      #    MAINTAINER: add token if private.
+      - name: Checkout soma-schema (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-schema
+          ref: main
+          path: soma-schema
+          # token: ${{ secrets.SOMA_SCHEMA_READ_TOKEN }}
+
+      # 3. Check out soma-infra.
+      #    MAINTAINER: add token if private.
+      - name: Checkout soma-infra (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-infra
+          ref: main
+          path: soma-infra
+          # token: ${{ secrets.SOMA_INFRA_READ_TOKEN }}
+
+      # 4. Check out soma-ui (dashboard path dep).
+      #    MAINTAINER: if soma-ui is private, add:  token: ${{ secrets.SOMA_UI_READ_TOKEN }}
+      - name: Checkout soma-ui (dashboard path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-ui
+          ref: main
+          path: soma-ui
+          # token: ${{ secrets.SOMA_UI_READ_TOKEN }}
+
+      # 5. Install Rust stable with wasm32 target.
+      - name: Install Rust stable + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      # 6. Cache Cargo.
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: soma-observe/dashboard
+
+      # 7. Install trunk.
+      - name: Install trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      # 8. Build the dashboard.
+      - name: trunk build (dashboard)
+        working-directory: soma-observe/dashboard
+        run: trunk build

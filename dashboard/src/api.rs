@@ -112,6 +112,15 @@ pub struct MetricPoint {
     pub count: Option<i64>,
 }
 
+/// Populated only for kind=Histogram series; absent for scalar series.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct HistogramSummary {
+    /// Explicit bucket upper bounds (N values for N+1 buckets including +Inf).
+    pub bounds: Vec<f64>,
+    /// Counts from the most recent histogram point in range (len == bounds.len()+1).
+    pub latest_bucket_counts: Vec<i64>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct QuerySeries {
     pub series_id: i64,
@@ -119,6 +128,9 @@ pub struct QuerySeries {
     pub attributes: serde_json::Value,
     pub kind: String,
     pub points: Vec<MetricPoint>,
+    /// Present only when kind == "Histogram".
+    #[serde(default)]
+    pub histogram: Option<HistogramSummary>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]

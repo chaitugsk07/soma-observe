@@ -1,0 +1,50 @@
+version: "3.9"
+
+# soma-observe + Postgres — one-command local/evaluation stack.
+#
+# Usage:
+#   docker compose up -d
+#
+# Point your OTel SDK at http://localhost:4318/v1/metrics (or /v1/logs).
+# Query the JSON API at http://localhost:4318/api/...
+#
+# To use an existing Postgres instead of the bundled one:
+#   Remove the `postgres` service, set DATABASE_URL to your connection string,
+#   and drop the `depends_on` block from soma-observe.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: soma
+      POSTGRES_USER: soma
+      POSTGRES_PASSWORD: soma
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U soma -d soma"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  soma-observe:
+    # Build from source with the parent dir as context:
+    #   docker compose -f soma-observe/docker-compose.yml build
+    # Or use the pre-built image (comment the build block and uncomment image:):
+    #   image: ghcr.io/chaitugsk07/soma-observe:latest
+    build:
+      context: ..
+      dockerfile: soma-observe/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://soma:soma@postgres:5432/soma
+      LISTEN_ADDR: "0.0.0.0:4318"
+      # Optional: set a bearer token to gate ingest/query endpoints.
+      # AUTH_TOKEN: "change-me"
+    ports:
+      - "4318:4318"   # OTLP/HTTP ingest + OTel-faithful JSON query API
+
+volumes:
+  postgres_data:

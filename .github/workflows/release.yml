@@ -1,0 +1,272 @@
+# Release pipeline for soma-observe
+#
+# Triggered on push of a tag matching v* (e.g. v0.1.0).
+#
+# MAINTAINER CHECKLIST — before this workflow is reliable:
+#
+# 1. SIBLING REPOS (private): If soma-infra, soma-schema, or soma-ui are
+#    private repos, add a PAT secret and pass it via:
+#      token: ${{ secrets.SOMA_INFRA_READ_TOKEN }}
+#    in each sibling checkout step below.
+#
+# 2. PACKAGES WRITE: The Docker build+push step uses GITHUB_TOKEN which
+#    requires the repository to have "Read and write" packages permission.
+#    Settings → Actions → General → Workflow permissions → "Read and write".
+#    Alternatively grant `packages: write` via GHCR_TOKEN secret.
+#
+# 3. GHCR VISIBILITY: After the first push, set the package visibility to
+#    Public in GitHub → Packages → soma-observe → Package settings.
+#
+# 4. DEFERRED (not in v1): signing/SBOM, multi-arch images, crates.io publish,
+#    Homebrew tap. Add these in a follow-up release.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # create GitHub Release + upload assets
+  packages: write   # push to ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1 — Linux static binary (musl, x86_64)
+  # ---------------------------------------------------------------------------
+  build-linux:
+    name: build-linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout soma-observe
+        uses: actions/checkout@v4
+        with:
+          path: soma-observe
+
+      - name: Checkout soma-schema
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-schema
+          ref: main
+          path: soma-schema
+          # token: ${{ secrets.SOMA_SCHEMA_READ_TOKEN }}
+
+      - name: Checkout soma-infra
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-infra
+          ref: main
+          path: soma-infra
+          # token: ${{ secrets.SOMA_INFRA_READ_TOKEN }}
+
+      - name: Checkout soma-ui
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-ui
+          ref: main
+          path: soma-ui
+          # token: ${{ secrets.SOMA_UI_READ_TOKEN }}
+
+      - name: Install Rust stable + targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,x86_64-unknown-linux-musl
+
+      - name: Install system deps (musl-tools)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: soma-observe
+
+      - name: Install trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      # Build dashboard first — rust-embed needs dashboard/dist/ at compile time.
+      - name: trunk build (dashboard)
+        working-directory: soma-observe/dashboard
+        run: trunk build --release
+
+      - name: cargo build --release (musl)
+        working-directory: soma-observe
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Rename binary
+        run: |
+          cp soma-observe/target/x86_64-unknown-linux-musl/release/soma-observe \
+             soma-observe-linux-x86_64
+
+      - name: Upload linux binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: soma-observe-linux-x86_64
+          path: soma-observe-linux-x86_64
+
+  # ---------------------------------------------------------------------------
+  # Job 2 — macOS binary (native, x86_64 or arm64 depending on runner)
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: build-macos
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout soma-observe
+        uses: actions/checkout@v4
+        with:
+          path: soma-observe
+
+      - name: Checkout soma-schema
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-schema
+          ref: main
+          path: soma-schema
+          # token: ${{ secrets.SOMA_SCHEMA_READ_TOKEN }}
+
+      - name: Checkout soma-infra
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-infra
+          ref: main
+          path: soma-infra
+          # token: ${{ secrets.SOMA_INFRA_READ_TOKEN }}
+
+      - name: Checkout soma-ui
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-ui
+          ref: main
+          path: soma-ui
+          # token: ${{ secrets.SOMA_UI_READ_TOKEN }}
+
+      - name: Install Rust stable + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: soma-observe
+
+      - name: Install trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      - name: trunk build (dashboard)
+        working-directory: soma-observe/dashboard
+        run: trunk build --release
+
+      - name: cargo build --release (native macOS)
+        working-directory: soma-observe
+        run: cargo build --release
+
+      - name: Rename binary
+        run: |
+          cp soma-observe/target/release/soma-observe \
+             soma-observe-macos-aarch64
+
+      - name: Upload macOS binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: soma-observe-macos-aarch64
+          path: soma-observe-macos-aarch64
+
+  # ---------------------------------------------------------------------------
+  # Job 3 — Docker image (build + push to ghcr.io)
+  # ---------------------------------------------------------------------------
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout soma-observe
+        uses: actions/checkout@v4
+        with:
+          path: soma-observe
+
+      - name: Checkout soma-schema
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-schema
+          ref: main
+          path: soma-schema
+          # token: ${{ secrets.SOMA_SCHEMA_READ_TOKEN }}
+
+      - name: Checkout soma-infra
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-infra
+          ref: main
+          path: soma-infra
+          # token: ${{ secrets.SOMA_INFRA_READ_TOKEN }}
+
+      - name: Checkout soma-ui
+        uses: actions/checkout@v4
+        with:
+          repository: chaitugsk07/soma-ui
+          ref: main
+          path: soma-ui
+          # token: ${{ secrets.SOMA_UI_READ_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract tag name
+        id: tag
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          # Build context is the runner workspace root (contains all sibling dirs).
+          context: .
+          file: soma-observe/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/chaitugsk07/soma-observe:${{ steps.tag.outputs.version }}
+            ghcr.io/chaitugsk07/soma-observe:latest
+
+  # ---------------------------------------------------------------------------
+  # Job 4 — GitHub Release (attach binaries + install.sh)
+  # ---------------------------------------------------------------------------
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-macos, docker]
+
+    steps:
+      - name: Checkout soma-observe (for install.sh)
+        uses: actions/checkout@v4
+
+      - name: Download linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: soma-observe-linux-x86_64
+
+      - name: Download macOS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: soma-observe-macos-aarch64
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            soma-observe-linux-x86_64
+            soma-observe-macos-aarch64
+            install.sh

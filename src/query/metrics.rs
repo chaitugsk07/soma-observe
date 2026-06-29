@@ -53,6 +53,18 @@ pub struct SeriesResult {
     pub attributes: Value,
     pub kind: String,
     pub points: Vec<Point>,
+    /// Populated only for Histogram series: bounds + latest bucket counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub histogram: Option<HistogramSummary>,
+}
+
+/// Snapshot of the most recent histogram bucket distribution in range.
+/// `bounds` has N entries (explicit upper bounds); `latest_bucket_counts`
+/// has N+1 entries (the last is the overflow / +Inf bucket).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HistogramSummary {
+    pub bounds: Vec<f64>,
+    pub latest_bucket_counts: Vec<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,7 +72,7 @@ pub struct Point {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub value: Option<f64>,
-    /// Only set for count aggregation.
+    /// Only set for count aggregation (scalar) or histogram series.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<i64>,
 }
@@ -199,8 +211,20 @@ pub async fn query_metrics(
         .into_response();
     }
 
-    // Aggregate metric_point for each series using date_bin.
-    // Returns: series_id, bucket_start, aggregated_value, point_count.
+    // Partition series into scalar (Gauge/Sum) and Histogram.
+    let scalar_ids: Vec<i64> = series_rows
+        .iter()
+        .filter(|r| r.kind != "Histogram")
+        .map(|r| r.series_id)
+        .collect();
+    let histogram_ids: Vec<i64> = series_rows
+        .iter()
+        .filter(|r| r.kind == "Histogram")
+        .map(|r| r.series_id)
+        .collect();
+
+    // ── Scalar bucket rows ────────────────────────────────────────────────────
+
     struct BucketRow {
         series_id: i64,
         bucket: DateTime<Utc>,
@@ -211,36 +235,33 @@ pub async fn query_metrics(
     // Build aggregate expression; for count, the "value" column holds the count.
     let agg_expr = agg_sql(agg);
 
-    // Use CAST instead of make_interval for compatibility (no type-checked query needed).
-    // Bind series_ids as an array for IN check.
-    let series_ids: Vec<i64> = series_rows.iter().map(|r| r.series_id).collect();
-
     // Dynamic SQL: substitute the aggregate expression (it's a fixed-set enum, safe).
-    let sql = format!(
-        r#"
-        SELECT
-            mp.series_id,
-            date_bin(
-                make_interval(secs => $1::float8),
-                mp.ts,
-                'epoch'::timestamptz
-            ) AS bucket,
-            {agg_expr} AS agg_value,
-            COUNT(*) AS point_count
-        FROM soma_observe.metric_point mp
-        WHERE mp.series_id = ANY($2::bigint[])
-          AND mp.ts >= $3
-          AND mp.ts < $4
-        GROUP BY mp.series_id, bucket
-        ORDER BY mp.series_id, bucket
-        "#,
-        agg_expr = agg_expr,
-    );
-
-    let bucket_rows: Vec<BucketRow> =
+    let scalar_bucket_rows: Vec<BucketRow> = if scalar_ids.is_empty() {
+        vec![]
+    } else {
+        let sql = format!(
+            r#"
+            SELECT
+                mp.series_id,
+                date_bin(
+                    make_interval(secs => $1::float8),
+                    mp.ts,
+                    'epoch'::timestamptz
+                ) AS bucket,
+                {agg_expr} AS agg_value,
+                COUNT(*) AS point_count
+            FROM soma_observe.metric_point mp
+            WHERE mp.series_id = ANY($2::bigint[])
+              AND mp.ts >= $3
+              AND mp.ts < $4
+            GROUP BY mp.series_id, bucket
+            ORDER BY mp.series_id, bucket
+            "#,
+            agg_expr = agg_expr,
+        );
         sqlx::query_as::<_, (i64, DateTime<Utc>, Option<f64>, i64)>(&sql)
             .bind(step_secs as f64)
-            .bind(&series_ids)
+            .bind(&scalar_ids)
             .bind(start)
             .bind(end)
             .fetch_all(&state.pool)
@@ -253,40 +274,183 @@ pub async fn query_metrics(
                 value,
                 count,
             })
-            .collect();
+            .collect()
+    };
 
-    // Group bucket rows by series_id.
+    // ── Histogram bucket rows (SUM(sum) / SUM(count) per date_bin) ────────────
+
+    struct HistoBucketRow {
+        series_id: i64,
+        bucket: DateTime<Utc>,
+        sum: Option<f64>,
+        count: Option<i64>,
+    }
+
+    let histo_bucket_rows: Vec<HistoBucketRow> = if histogram_ids.is_empty() {
+        vec![]
+    } else {
+        sqlx::query_as::<_, (i64, DateTime<Utc>, Option<f64>, Option<i64>)>(
+            r#"
+            SELECT
+                mhp.series_id,
+                date_bin(
+                    make_interval(secs => $1::float8),
+                    mhp.ts,
+                    'epoch'::timestamptz
+                ) AS bucket,
+                SUM(mhp.sum)          AS agg_sum,
+                SUM(mhp.count)::bigint AS agg_count
+            FROM soma_observe.metric_histogram_point mhp
+            WHERE mhp.series_id = ANY($2::bigint[])
+              AND mhp.ts >= $3
+              AND mhp.ts < $4
+            GROUP BY mhp.series_id, bucket
+            ORDER BY mhp.series_id, bucket
+            "#,
+        )
+        .bind(step_secs as f64)
+        .bind(&histogram_ids)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(series_id, bucket, sum, count)| HistoBucketRow {
+            series_id,
+            bucket,
+            sum,
+            count,
+        })
+        .collect()
+    };
+
+    // ── Latest bucket distribution (most recent histogram point in range) ─────
+
+    struct HistoSummaryRow {
+        series_id: i64,
+        bounds: Value,
+        bucket_counts: Value,
+    }
+
+    let histo_summary_rows: Vec<HistoSummaryRow> = if histogram_ids.is_empty() {
+        vec![]
+    } else {
+        // One row per series_id: the latest histogram point in the query range.
+        sqlx::query_as::<_, (i64, Value, Value)>(
+            r#"
+            SELECT DISTINCT ON (mhp.series_id)
+                mhp.series_id,
+                mhp.bounds,
+                mhp.bucket_counts
+            FROM soma_observe.metric_histogram_point mhp
+            WHERE mhp.series_id = ANY($1::bigint[])
+              AND mhp.ts >= $2
+              AND mhp.ts < $3
+              AND mhp.bounds IS NOT NULL
+              AND mhp.bucket_counts IS NOT NULL
+            ORDER BY mhp.series_id, mhp.ts DESC
+            "#,
+        )
+        .bind(&histogram_ids)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(series_id, bounds, bucket_counts)| HistoSummaryRow {
+            series_id,
+            bounds,
+            bucket_counts,
+        })
+        .collect()
+    };
+
+    // ── Assemble results ──────────────────────────────────────────────────────
+
     let mut series_results: Vec<SeriesResult> = series_rows
         .iter()
         .map(|sr| {
-            let points: Vec<Point> = bucket_rows
-                .iter()
-                .filter(|br| br.series_id == sr.series_id)
-                .map(|br| {
-                    let bucket_end = br.bucket + chrono::Duration::seconds(step_secs);
-                    if agg == "count" {
+            if sr.kind == "Histogram" {
+                // Histogram points: value = SUM(sum), count = SUM(count)
+                let points: Vec<Point> = histo_bucket_rows
+                    .iter()
+                    .filter(|br| br.series_id == sr.series_id)
+                    .map(|br| {
+                        let bucket_end = br.bucket + chrono::Duration::seconds(step_secs);
                         Point {
                             start: br.bucket,
                             end: bucket_end,
-                            value: Some(br.count as f64),
-                            count: Some(br.count),
+                            value: br.sum,
+                            count: br.count,
                         }
-                    } else {
-                        Point {
-                            start: br.bucket,
-                            end: bucket_end,
-                            value: br.value,
-                            count: None,
+                    })
+                    .collect();
+
+                // Build HistogramSummary from the latest bucket distribution.
+                let histogram = histo_summary_rows
+                    .iter()
+                    .find(|hs| hs.series_id == sr.series_id)
+                    .and_then(|hs| {
+                        let bounds: Vec<f64> = hs
+                            .bounds
+                            .as_array()?
+                            .iter()
+                            .filter_map(|v| v.as_f64())
+                            .collect();
+                        let latest_bucket_counts: Vec<i64> = hs
+                            .bucket_counts
+                            .as_array()?
+                            .iter()
+                            .filter_map(|v| v.as_i64())
+                            .collect();
+                        Some(HistogramSummary {
+                            bounds,
+                            latest_bucket_counts,
+                        })
+                    });
+
+                SeriesResult {
+                    series_id: sr.series_id,
+                    resource: sr.resource.clone(),
+                    attributes: sr.attributes.clone(),
+                    kind: sr.kind.clone(),
+                    points,
+                    histogram,
+                }
+            } else {
+                // Scalar series
+                let points: Vec<Point> = scalar_bucket_rows
+                    .iter()
+                    .filter(|br| br.series_id == sr.series_id)
+                    .map(|br| {
+                        let bucket_end = br.bucket + chrono::Duration::seconds(step_secs);
+                        if agg == "count" {
+                            Point {
+                                start: br.bucket,
+                                end: bucket_end,
+                                value: Some(br.count as f64),
+                                count: Some(br.count),
+                            }
+                        } else {
+                            Point {
+                                start: br.bucket,
+                                end: bucket_end,
+                                value: br.value,
+                                count: None,
+                            }
                         }
-                    }
-                })
-                .collect();
-            SeriesResult {
-                series_id: sr.series_id,
-                resource: sr.resource.clone(),
-                attributes: sr.attributes.clone(),
-                kind: sr.kind.clone(),
-                points,
+                    })
+                    .collect();
+                SeriesResult {
+                    series_id: sr.series_id,
+                    resource: sr.resource.clone(),
+                    attributes: sr.attributes.clone(),
+                    kind: sr.kind.clone(),
+                    points,
+                    histogram: None,
+                }
             }
         })
         .collect();
@@ -793,5 +957,267 @@ mod tests {
             .expect("body");
         let parsed: MetricsQueryResponse = serde_json::from_slice(&body).expect("parse");
         assert!(parsed.series.is_empty(), "no series for unknown metric");
+    }
+
+    // ── Helper: insert a histogram series + points ────────────────────────────
+
+    /// Insert a Histogram series row and return its series_id.
+    async fn insert_histogram_series(pool: &sqlx::PgPool, name: &str) -> i64 {
+        insert_series(pool, name, "Histogram", &json!({}), &json!({})).await
+    }
+
+    /// Insert a histogram point.
+    async fn insert_histogram_point(
+        pool: &sqlx::PgPool,
+        series_id: i64,
+        ts: DateTime<Utc>,
+        sum: f64,
+        count: i64,
+        bounds: &[f64],
+        bucket_counts: &[i64],
+    ) {
+        use crate::store::schema::HistogramPoint;
+        use crate::store::write::write_histogram_points;
+        write_histogram_points(
+            pool,
+            &[HistogramPoint {
+                series_id,
+                ts,
+                sum: Some(sum),
+                count: Some(count),
+                bounds: Some(json!(bounds)),
+                bucket_counts: Some(json!(bucket_counts)),
+            }],
+        )
+        .await
+        .expect("insert histogram point");
+    }
+
+    fn make_cfg() -> crate::config::Config {
+        crate::config::Config {
+            database_url: std::env::var("TEST_DATABASE_URL").unwrap_or_default(),
+            listen_addr: "127.0.0.1:4318".into(),
+            auth_token: None,
+            metrics_retention_days: 90,
+            logs_retention_days: 30,
+            ingest_window_secs: 3600,
+            future_tolerance_secs: 300,
+        }
+    }
+
+    // ── Histogram integration tests ───────────────────────────────────────────
+
+    /// Points for a Histogram series return value=SUM(sum) and count=SUM(count)
+    /// per date_bin bucket, and the HistogramSummary is populated with the
+    /// latest bucket distribution.
+    #[tokio::test]
+    async fn integration_query_histogram_points_and_summary() {
+        let Some(db) = test_db().await else {
+            eprintln!(
+                "SKIP integration_query_histogram_points_and_summary: TEST_DATABASE_URL not set"
+            );
+            return;
+        };
+
+        let metric = format!(
+            "histo.query.{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let sid = insert_histogram_series(&db.pool, &metric).await;
+
+        // Align base to a 120-second bucket boundary so all points land in the
+        // same bucket (same guard as the scalar tests above).
+        let raw_secs = (Utc::now() - Duration::minutes(5)).timestamp();
+        let aligned_secs = raw_secs - raw_secs.rem_euclid(120);
+        let base = chrono::DateTime::from_timestamp(aligned_secs, 0).unwrap();
+
+        // Two histogram observations in the same bucket:
+        //   obs1: sum=10, count=3, bounds=[0.5,1.0], bucket_counts=[1,1,1]
+        //   obs2: sum=20, count=5, bounds=[0.5,1.0], bucket_counts=[2,2,1]
+        // Expected bucket aggregation: value=SUM(sum)=30, count=SUM(count)=8
+        insert_histogram_point(
+            &db.pool,
+            sid,
+            base,
+            10.0,
+            3,
+            &[0.5, 1.0],
+            &[1, 1, 1],
+        )
+        .await;
+        insert_histogram_point(
+            &db.pool,
+            sid,
+            base + Duration::seconds(10),
+            20.0,
+            5,
+            &[0.5, 1.0],
+            &[2, 2, 1],
+        )
+        .await;
+
+        let state = Arc::new(crate::state::AppState::new(db.pool.clone(), make_cfg()));
+        let start_str = (base - Duration::seconds(1)).to_rfc3339();
+        let end_str = (base + Duration::minutes(5)).to_rfc3339();
+
+        let resp = query_metrics(
+            State(state),
+            Query(MetricsQueryParams {
+                name: metric.clone(),
+                start: start_str,
+                end: end_str,
+                step: Some(120),
+                filter: None,
+                agg: Some("avg".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let parsed: MetricsQueryResponse = serde_json::from_slice(&body).expect("parse");
+
+        assert_eq!(parsed.series.len(), 1, "must return one histogram series");
+        let sr = &parsed.series[0];
+        assert_eq!(sr.kind, "Histogram");
+
+        // One bucket; value = SUM(sum), count = SUM(count)
+        assert_eq!(sr.points.len(), 1, "one bucket in range");
+        let pt = &sr.points[0];
+        assert!(
+            (pt.value.unwrap_or(0.0) - 30.0).abs() < 1e-9,
+            "SUM(sum) must be 30, got {:?}",
+            pt.value
+        );
+        assert_eq!(pt.count, Some(8), "SUM(count) must be 8");
+
+        // HistogramSummary must be present with the latest observation's data.
+        let hs = sr
+            .histogram
+            .as_ref()
+            .expect("histogram summary must be present");
+        assert_eq!(hs.bounds, vec![0.5, 1.0], "bounds must match");
+        // N bounds → N+1 bucket_counts (overflow included)
+        assert_eq!(
+            hs.latest_bucket_counts.len(),
+            hs.bounds.len() + 1,
+            "latest_bucket_counts must have bounds.len()+1 entries (overflow bucket)"
+        );
+        // Latest obs has bucket_counts=[2,2,1]
+        assert_eq!(
+            hs.latest_bucket_counts,
+            vec![2, 2, 1],
+            "latest_bucket_counts must reflect most recent observation"
+        );
+    }
+
+    /// An empty time range yields empty points and None histogram summary.
+    #[tokio::test]
+    async fn integration_query_histogram_empty_range() {
+        let Some(db) = test_db().await else {
+            eprintln!(
+                "SKIP integration_query_histogram_empty_range: TEST_DATABASE_URL not set"
+            );
+            return;
+        };
+
+        let metric = format!(
+            "histo.empty.{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let sid = insert_histogram_series(&db.pool, &metric).await;
+
+        // Insert a point in the past (outside the query range below).
+        let past = Utc::now() - Duration::hours(2);
+        insert_histogram_point(&db.pool, sid, past, 5.0, 2, &[1.0], &[1, 1]).await;
+
+        let state = Arc::new(crate::state::AppState::new(db.pool.clone(), make_cfg()));
+
+        // Query a range that contains no points (one hour ago → 30 min ago).
+        let range_start = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        let range_end = (Utc::now() - Duration::minutes(30)).to_rfc3339();
+
+        let resp = query_metrics(
+            State(state),
+            Query(MetricsQueryParams {
+                name: metric.clone(),
+                start: range_start,
+                end: range_end,
+                step: Some(60),
+                filter: None,
+                agg: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let parsed: MetricsQueryResponse = serde_json::from_slice(&body).expect("parse");
+
+        // The series exists but has no points in range → retained only if
+        // series_results.retain(!points.is_empty()) passes.
+        // With no points the series is filtered out.
+        assert!(
+            parsed.series.is_empty(),
+            "no points in range → series filtered out"
+        );
+    }
+
+    /// Scalar (non-histogram) series must be unaffected by histogram logic:
+    /// no `histogram` field in the JSON response (serde skip_serializing_if).
+    #[tokio::test]
+    async fn integration_scalar_series_has_no_histogram_field() {
+        let Some(db) = test_db().await else {
+            eprintln!(
+                "SKIP integration_scalar_series_has_no_histogram_field: TEST_DATABASE_URL not set"
+            );
+            return;
+        };
+
+        let metric = format!(
+            "scalar.nohisto.{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let sid = insert_series(&db.pool, &metric, "Gauge", &json!({}), &json!({})).await;
+
+        let raw_secs = (Utc::now() - Duration::minutes(5)).timestamp();
+        let aligned_secs = raw_secs - raw_secs.rem_euclid(120);
+        let base = chrono::DateTime::from_timestamp(aligned_secs, 0).unwrap();
+        insert_point(&db.pool, sid, base, 7.0).await;
+
+        let state = Arc::new(crate::state::AppState::new(db.pool.clone(), make_cfg()));
+        let start_str = (base - Duration::seconds(1)).to_rfc3339();
+        let end_str = (base + Duration::minutes(5)).to_rfc3339();
+
+        let resp = query_metrics(
+            State(state),
+            Query(MetricsQueryParams {
+                name: metric.clone(),
+                start: start_str,
+                end: end_str,
+                step: Some(120),
+                filter: None,
+                agg: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+
+        // Confirm the `histogram` key is absent in JSON for scalar series.
+        let raw: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        let series_arr = raw["series"].as_array().expect("series array");
+        assert_eq!(series_arr.len(), 1, "one scalar series");
+        assert!(
+            series_arr[0].get("histogram").is_none(),
+            "scalar series must not have histogram field in JSON"
+        );
     }
 }
