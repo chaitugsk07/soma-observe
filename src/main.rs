@@ -112,6 +112,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(query::metrics::list_metric_series),
         )
         .route("/api/v1/logs/query", get(query::logs::query_logs))
+        .route("/api/v1/services", get(query::services::service_map))
         .route("/api/v1/traces/query", get(query::traces::query_traces))
         .route("/api/v1/traces/{trace_id}", get(query::traces::get_trace))
         // Alert CRUD + state endpoints

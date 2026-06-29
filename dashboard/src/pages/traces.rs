@@ -251,7 +251,7 @@ pub fn TracesPage() -> impl IntoView {
 
     let token_sig = ctx.token;
 
-    let do_query = move |_| {
+    let run_query = move || {
         let token = token_sig.get_untracked();
         let service = service_val.get_untracked();
         let name = name_val.get_untracked();
@@ -298,6 +298,10 @@ pub fn TracesPage() -> impl IntoView {
             query_done.set(true);
         });
     };
+    let do_query = {
+        let run_query = run_query.clone();
+        move |_: web_sys::MouseEvent| run_query()
+    };
 
     // Load spans when a trace row is clicked (or deep-linked).
     let load_spans = move |trace_id: String| {
@@ -318,9 +322,15 @@ pub fn TracesPage() -> impl IntoView {
 
     let on_row_click = load_spans.clone();
 
-    // On mount: if ?trace_id=<id> is present, auto-open that trace's waterfall.
+    // On mount: handle deep-link query params.
+    // ?trace_id=<id> → auto-open that trace's waterfall.
+    // ?service=<name> → pre-fill service filter and auto-run the query.
     Effect::new(move |_| {
         let params = query_map.get();
+        if let Some(svc) = params.get("service").filter(|s| !s.is_empty()) {
+            service_val.set(svc);
+            run_query();
+        }
         if let Some(tid) = params.get("trace_id").filter(|s| !s.is_empty()) {
             load_spans(tid);
         }

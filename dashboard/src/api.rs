@@ -359,6 +359,64 @@ pub async fn query_logs(
     Ok(records)
 }
 
+/// Per-service RED metrics — mirrors server ServiceStats.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ServiceStats {
+    pub name: String,
+    pub span_count: i64,
+    pub error_count: i64,
+    pub error_rate: f64,
+    pub rate_per_sec: f64,
+    pub p50_ms: f64,
+    pub p90_ms: f64,
+    pub p99_ms: f64,
+}
+
+/// Caller → callee dependency edge — mirrors server ServiceEdge.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ServiceEdge {
+    pub from: String,
+    pub to: String,
+    pub call_count: i64,
+    pub error_count: i64,
+    pub p99_ms: f64,
+}
+
+/// Response envelope — mirrors server ServiceMapResponse.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ServiceMap {
+    pub services: Vec<ServiceStats>,
+    pub edges: Vec<ServiceEdge>,
+}
+
+/// GET /api/v1/services?start=&end=
+pub async fn get_service_map(
+    token: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Result<ServiceMap, ApiError> {
+    let mut url = "/api/v1/services?".to_string();
+    let mut first = true;
+    let mut push = |k: &str, v: &str| {
+        if !first {
+            url.push('&');
+        }
+        first = false;
+        url.push_str(&format!("{}={}", k, urlencoded(v)));
+    };
+    if let Some(v) = start {
+        if !v.is_empty() {
+            push("start", v);
+        }
+    }
+    if let Some(v) = end {
+        if !v.is_empty() {
+            push("end", v);
+        }
+    }
+    get_json::<ServiceMap>(&url, token).await
+}
+
 /// GET /api/v1/traces/query — returns a JSON array of TraceSummary.
 pub async fn query_traces(
     token: &str,

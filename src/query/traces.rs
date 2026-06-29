@@ -146,7 +146,13 @@ pub async fn query_traces(
             CASE WHEN agg.has_error THEN 'error' ELSE 'ok' END AS status
         FROM agg
         JOIN root ON root.trace_id = agg.trace_id
-        WHERE ($3::text IS NULL OR root.root_service = $3)
+        WHERE ($3::text IS NULL OR EXISTS (
+                  SELECT 1 FROM soma_observe.spans s2
+                  WHERE s2.trace_id = agg.trace_id
+                    AND s2.service_name = $3
+                    AND s2.start_time >= $1
+                    AND s2.start_time < $2
+              ))
           AND ($4::text IS NULL OR root.root_name = $4)
           AND ($5::text IS NULL OR (CASE WHEN agg.has_error THEN 'error' ELSE 'ok' END) = $5)
           AND ($6::bigint IS NULL OR agg.duration_ms >= $6)
@@ -683,6 +689,133 @@ mod tests {
             .collect();
         assert_eq!(our.len(), 1, "only error trace must appear");
         assert_eq!(our[0].status, "error");
+    }
+
+    // ── Integration: service filter matches any span (not only root) ─────────
+
+    /// Seed a trace: root span is "frontend", child span is "backend".
+    /// Querying service=backend must return the trace (summary shows root=frontend).
+    /// Querying service=frontend must also return it.
+    /// Querying service=nonexistent must return nothing.
+    #[tokio::test]
+    async fn integration_traces_service_filter_involves_any_span() {
+        let Some(db) = test_db().await else {
+            eprintln!(
+                "SKIP integration_traces_service_filter_involves_any_span: TEST_DATABASE_URL not set"
+            );
+            return;
+        };
+
+        let base = Utc::now() - Duration::minutes(5);
+        let suffix = base.timestamp_nanos_opt().unwrap_or(0);
+        let trace_id = format!("involve{suffix:012x}");
+
+        // Root span — service "frontend"
+        seed_span(
+            &db.pool,
+            &trace_id,
+            "inv0001",
+            None,
+            "frontend-root",
+            Some("frontend"),
+            base,
+            base + Duration::milliseconds(300),
+            None,
+        )
+        .await;
+        // Child span — service "backend"
+        seed_span(
+            &db.pool,
+            &trace_id,
+            "inv0002",
+            Some("inv0001"),
+            "backend-call",
+            Some("backend"),
+            base + Duration::milliseconds(10),
+            base + Duration::milliseconds(200),
+            None,
+        )
+        .await;
+
+        let state = Arc::new(crate::state::AppState::new(db.pool.clone(), make_cfg()));
+        let window_start = (base - Duration::seconds(1)).to_rfc3339();
+        let window_end = (base + Duration::minutes(2)).to_rfc3339();
+
+        // Query service=backend → must return the trace; root_service is "frontend".
+        let resp = query_traces(
+            State(state.clone()),
+            Query(TracesQueryParams {
+                service: Some("backend".to_string()),
+                name: None,
+                status: None,
+                min_duration_ms: None,
+                max_duration_ms: None,
+                start: window_start.clone(),
+                end: window_end.clone(),
+                limit: Some(50),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let summaries: Vec<TraceSummary> = serde_json::from_slice(&body).unwrap();
+        let found = summaries.iter().find(|s| s.trace_id == trace_id)
+            .expect("service=backend must return the trace that involves backend");
+        assert_eq!(
+            found.root_service.as_deref(),
+            Some("frontend"),
+            "summary root_service must still be the root span's service"
+        );
+
+        // Query service=frontend → must also return the trace.
+        let resp2 = query_traces(
+            State(state.clone()),
+            Query(TracesQueryParams {
+                service: Some("frontend".to_string()),
+                name: None,
+                status: None,
+                min_duration_ms: None,
+                max_duration_ms: None,
+                start: window_start.clone(),
+                end: window_end.clone(),
+                limit: Some(50),
+            }),
+        )
+        .await;
+        let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let summaries2: Vec<TraceSummary> = serde_json::from_slice(&body2).unwrap();
+        assert!(
+            summaries2.iter().any(|s| s.trace_id == trace_id),
+            "service=frontend must also return the trace"
+        );
+
+        // Query service=nonexistent → must not return the trace.
+        let resp3 = query_traces(
+            State(state),
+            Query(TracesQueryParams {
+                service: Some("nonexistent".to_string()),
+                name: None,
+                status: None,
+                min_duration_ms: None,
+                max_duration_ms: None,
+                start: window_start,
+                end: window_end,
+                limit: Some(50),
+            }),
+        )
+        .await;
+        let body3 = axum::body::to_bytes(resp3.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let summaries3: Vec<TraceSummary> = serde_json::from_slice(&body3).unwrap();
+        assert!(
+            summaries3.iter().all(|s| s.trace_id != trace_id),
+            "service=nonexistent must not return the trace"
+        );
     }
 
     // ── Integration: get_trace returns all spans in order ─────────────────────

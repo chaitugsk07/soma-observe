@@ -1,5 +1,6 @@
 pub mod logs;
 pub mod metrics;
+pub mod services;
 pub mod traces;
 
 use chrono::{DateTime, Utc};
