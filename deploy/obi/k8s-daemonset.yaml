@@ -1,0 +1,142 @@
+# OBI (Grafana Beyla) — cluster-wide DaemonSet for soma-observe
+#
+# Requirements:
+#   - Linux kernel 5.8+ with BTF (/sys/kernel/btf/vmlinux) on every node.
+#     Cross-service context propagation needs kernel 5.17+.
+#   - Replace <SOMA_OBSERVE_NAMESPACE> with the namespace soma-observe runs in.
+#   - TLS note: OBI intercepts OpenSSL/libssl3 and Go crypto/tls only.
+#     BoringSSL and rustls are NOT supported; context propagation may be
+#     incomplete for HTTPS traffic through L7 proxies or load balancers.
+#
+# Apply:
+#   kubectl apply -f k8s-daemonset.yaml
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: obi
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: beyla
+  namespace: obi
+
+---
+# Minimal RBAC: read pods/replicasets/nodes so Beyla can attach k8s metadata
+# (namespace, workload name, node) to every span and metric it emits.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: beyla
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: beyla
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: beyla
+subjects:
+  - kind: ServiceAccount
+    name: beyla
+    namespace: obi
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: beyla
+  namespace: obi
+  labels:
+    app: beyla
+spec:
+  selector:
+    matchLabels:
+      app: beyla
+  template:
+    metadata:
+      labels:
+        app: beyla
+    spec:
+      serviceAccountName: beyla
+
+      # hostPID lets Beyla attach eBPF probes to processes on the host and
+      # in every pod on the node without sidecar injection.
+      hostPID: true
+
+      containers:
+        - name: beyla
+          image: grafana/beyla:latest
+          imagePullPolicy: Always
+
+          env:
+            # Point at soma-observe. Replace <SOMA_OBSERVE_NAMESPACE>.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://soma-observe.<SOMA_OBSERVE_NAMESPACE>.svc.cluster.local:4318"
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: "http/protobuf"
+            # Instrument every process on the node automatically.
+            - name: BEYLA_DISCOVERY_INSTRUMENT_ALL
+              value: "true"
+            # Cross-service context propagation (kernel 5.17+).
+            - name: BEYLA_BPF_CONTEXT_PROPAGATION
+              value: "all"
+            # If soma-observe runs with AUTH_TOKEN, set these instead of
+            # OTEL_EXPORTER_OTLP_HEADERS (the generic header is ignored by
+            # Beyla's metrics exporter in some versions):
+            #   - name: OTEL_EXPORTER_OTLP_TRACES_HEADERS
+            #     value: "Authorization=Bearer <token>"
+            #   - name: OTEL_EXPORTER_OTLP_METRICS_HEADERS
+            #     value: "Authorization=Bearer <token>"
+
+          securityContext:
+            # Privileged is the simplest path. To use least-privilege caps instead,
+            # remove privileged: true and uncomment the capabilities block below.
+            privileged: true
+            # --- Least-privilege alternative (comment out privileged: true first) ---
+            # privileged: false
+            # capabilities:
+            #   add:
+            #     - CAP_BPF          # load/attach eBPF programs
+            #     - CAP_PERFMON      # read perf events
+            #     - CAP_SYS_PTRACE   # read process memory (uprobes)
+            #     - CAP_NET_ADMIN    # attach TC/XDP programs for context propagation
+            # runAsNonRoot: false    # required for kernel object access
+
+          volumeMounts:
+            - name: btf
+              mountPath: /sys/kernel/btf
+              readOnly: true
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+      volumes:
+        - name: btf
+          hostPath:
+            path: /sys/kernel/btf
+            type: Directory
+
+      tolerations:
+        # Run on all nodes including control-plane.
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute

@@ -1,0 +1,10 @@
+# Beyla (OBI distribution) discovery config.
+# Two nginx services are instrumented by port, each gets a distinct service name.
+# Mounted into the beyla container at /config/beyla-config.yml.
+
+discovery:
+  services:
+    - name: frontend
+      open_ports: "8080"
+    - name: backend
+      open_ports: "80"

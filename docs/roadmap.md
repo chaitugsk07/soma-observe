@@ -11,6 +11,7 @@ for the next.
 - Alerting: background rule evaluator (metric-threshold + log-count) with state machine + webhook notifications.
 - CORS for direct browser OTLP; optional bearer auth; single binary + Postgres.
 - Kubernetes topology view (namespace → workload RED, from k8s resource attrs).
+- eBPF zero-code capture via OBI (deploy recipes + docs) — auto-populates the service map + k8s view.
 
 ## The target: a SigNoz/KubeSense-class platform — 4 pillars
 1. **Agentless eBPF zero-code capture** — telemetry from running pods, no SDK.
@@ -29,9 +30,9 @@ for the next.
 3. *Shipped.* **Kubernetes metadata enrichment + a k8s view.**
    Tag telemetry with pod/namespace/node/deployment/workload (OTel `k8sattributes` processor → index those resource attrs → a k8s topology view). Makes it *Kube*-sense, and is the landing pad for eBPF telemetry (which is already tagged with k8s resource attrs).
 
-4. **eBPF zero-code — by integrating OBI/Beyla, not writing kernel code.**
-   Bundle/document Grafana **OBI** (Beyla) or **Odigos** as a DaemonSet → OTLP → soma-observe. Leverage the OTel-eBPF ecosystem (it all emits OTLP, so the backend is unchanged). The eBPF-sourced spans populate the service map (#2) and k8s topology (#3). Building a custom CO-RE/libbpf agent is a separate multi-quarter track, taken only once this proves out.
-   - **Parallel hard dependency — columnar storage tier (DataFusion/Parquet).** eBPF + k8s = enormous volume (every request across every pod). The Postgres ceiling (~5-10M points/day) will not hold it, so scale stops being optional here. Start it in parallel with #3/#4. (The OTLP ingest + query contracts stay unchanged; only storage swaps underneath — see install-design.md §8.)
+4. *Integration shipped (OBI).* **eBPF zero-code — by integrating OBI/Beyla, not writing kernel code.**
+   `deploy/obi/` ships a docker-compose demo and a k8s DaemonSet. Beyla (OBI distribution) exports OTLP to soma-observe; zero-code traces + RED metrics flow into the existing service map and k8s topology views unchanged. See `docs/ebpf-obi.md`. Building a custom CO-RE/libbpf agent (soma-probe) is a separate multi-quarter track.
+   - **Open scale gate — columnar storage tier (DataFusion/Parquet).** eBPF + k8s = enormous volume (every request across every pod). The Postgres ceiling (~5-10M points/day) will not hold it. (The OTLP ingest + query contracts stay unchanged; only storage swaps underneath — see install-design.md §8.)
 
 5. **AI-agentic RCA + anomaly detection** — the capstone, and the real differentiator.
    Feed an LLM the correlated telemetry + service map + recent k8s changes and ask "why did latency spike?" → it does exactly the cross-signal pivots built in #1 and proposes a root cause + fix. Only as good as the structured, correlated data beneath it (needs #1-#3). soma-platform already ships `soma-infra::llm` (an Anthropic client) — the LLM plumbing KubeSense had to build is already here. This is the 2026 frontier.

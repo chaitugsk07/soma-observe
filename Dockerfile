@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — Rust + Trunk builder
 # ---------------------------------------------------------------------------
-FROM rust:1.82-slim AS builder
+FROM rust:1.96-slim AS builder
 
 # Install system dependencies for musl-libc linking and Trunk tooling.
 RUN apt-get update && apt-get install -y --no-install-recommends \
