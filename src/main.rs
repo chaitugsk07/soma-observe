@@ -4,6 +4,7 @@ mod admin;
 mod alerts;
 mod auth;
 mod config;
+mod dashboards;
 mod ingest;
 mod install;
 mod portal;
@@ -126,6 +127,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             put(alerts::update_rule).delete(alerts::delete_rule),
         )
         .route("/api/v1/alerts", get(alerts::list_active_alerts))
+        // Dashboard CRUD endpoints
+        .route(
+            "/api/v1/dashboards",
+            get(dashboards::list_dashboards).post(dashboards::create_dashboard),
+        )
+        .route(
+            "/api/v1/dashboards/{id}",
+            get(dashboards::get_dashboard)
+                .put(dashboards::update_dashboard)
+                .delete(dashboards::delete_dashboard),
+        )
         // Admin endpoints
         .route("/health", get(admin::health))
         .route("/api/v1/admin/stats", get(admin::stats))

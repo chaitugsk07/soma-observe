@@ -28,3 +28,10 @@ versions:
         created: "2026-06-29"
         author: "soma-observe"
         why: "OTLP NumberDataPoints carry exemplars (sampled trace_id/span_id). Storing them on metric_point lets the UI deep-link from a metric data point to the corresponding trace."
+  - version: 5
+    description: "Add dashboards table for user-defined metric panel collections"
+    migrations:
+      - file: "20260629_04_dashboards.sql"
+        created: "2026-06-29"
+        author: "soma-observe"
+        why: "Savable dashboards: named collections of metric panels stored as opaque jsonb. Config data — not partitioned."

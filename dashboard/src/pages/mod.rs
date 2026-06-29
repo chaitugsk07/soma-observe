@@ -1,4 +1,5 @@
 mod alerts;
+mod dashboards;
 pub mod kubernetes;
 mod logs;
 mod metrics;
@@ -8,6 +9,7 @@ pub mod services;
 pub mod traces;
 
 pub use alerts::AlertsPage;
+pub use dashboards::DashboardsPage;
 pub use kubernetes::KubernetesPage;
 pub use logs::LogsPage;
 pub use metrics::MetricsPage;

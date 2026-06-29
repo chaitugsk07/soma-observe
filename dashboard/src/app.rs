@@ -1,6 +1,6 @@
 //! App shell: router, sidebar, header with token input.
 
-use crate::pages::{AlertsPage, KubernetesPage, LogsPage, MetricsPage, OverviewPage, RetentionPage, ServicesPage, TracesPage};
+use crate::pages::{AlertsPage, DashboardsPage, KubernetesPage, LogsPage, MetricsPage, OverviewPage, RetentionPage, ServicesPage, TracesPage};
 use leptos::prelude::*;
 use leptos_router::{
     components::{FlatRoutes, Route, Router},
@@ -40,6 +40,11 @@ fn sidebar_items() -> Vec<SidebarItem> {
             label: "Metrics".to_string(),
             href: "/metrics".to_string(),
             icon: Some(soma_ui::icons::icondata::LuActivity),
+        },
+        SidebarItem {
+            label: "Dashboards".to_string(),
+            href: "/dashboards".to_string(),
+            icon: Some(soma_ui::icons::icondata::LuLayoutGrid),
         },
         SidebarItem {
             label: "Logs".to_string(),
@@ -151,6 +156,7 @@ pub fn App() -> impl IntoView {
                 <FlatRoutes fallback=|| view! { <div class="text-muted-foreground">"Page not found"</div> }>
                     <Route path=path!("/") view=OverviewPage />
                     <Route path=path!("/metrics") view=MetricsPage />
+                    <Route path=path!("/dashboards") view=DashboardsPage />
                     <Route path=path!("/logs") view=LogsPage />
                     <Route path=path!("/traces") view=TracesPage />
                     <Route path=path!("/services") view=ServicesPage />

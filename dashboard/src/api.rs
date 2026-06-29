@@ -634,6 +634,80 @@ pub async fn list_active_alerts(token: &str) -> Result<Vec<ActiveAlert>, ApiErro
     get_json::<Vec<ActiveAlert>>("/api/v1/alerts", token).await
 }
 
+// ── Dashboard types ───────────────────────────────────────────────────────────
+
+/// One panel definition stored inside a dashboard's panels jsonb.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Panel {
+    pub title: String,
+    /// Metric name to query.
+    pub metric: String,
+    /// Chart type: "line" | "area" | "bar" | "stat" | "sparkline"
+    pub chart_type: String,
+    /// Relative time range: "15m" | "1h" | "6h" | "24h"
+    pub range: String,
+    /// Aggregation: "avg" | "sum" | "min" | "max" | "count"
+    pub agg: String,
+}
+
+/// Lightweight dashboard summary from GET /api/v1/dashboards (no panels).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DashboardSummary {
+    pub id: i64,
+    pub name: String,
+    pub updated_at: String,
+}
+
+/// Full dashboard from GET /api/v1/dashboards/{id}.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Dashboard {
+    pub id: i64,
+    pub name: String,
+    pub panels: Vec<Panel>,
+    pub updated_at: String,
+}
+
+// ── Dashboard API functions ───────────────────────────────────────────────────
+
+/// GET /api/v1/dashboards
+pub async fn list_dashboards(token: &str) -> Result<Vec<DashboardSummary>, ApiError> {
+    get_json::<Vec<DashboardSummary>>("/api/v1/dashboards", token).await
+}
+
+/// GET /api/v1/dashboards/{id}
+pub async fn get_dashboard(token: &str, id: i64) -> Result<Dashboard, ApiError> {
+    let path = format!("/api/v1/dashboards/{}", id);
+    get_json::<Dashboard>(&path, token).await
+}
+
+/// POST /api/v1/dashboards
+pub async fn create_dashboard(
+    token: &str,
+    name: &str,
+    panels: &[Panel],
+) -> Result<Dashboard, ApiError> {
+    let body = serde_json::json!({ "name": name, "panels": panels });
+    send_json::<Dashboard>("POST", "/api/v1/dashboards", token, &body).await
+}
+
+/// PUT /api/v1/dashboards/{id}
+pub async fn update_dashboard(
+    token: &str,
+    id: i64,
+    name: &str,
+    panels: &[Panel],
+) -> Result<Dashboard, ApiError> {
+    let path = format!("/api/v1/dashboards/{}", id);
+    let body = serde_json::json!({ "name": name, "panels": panels });
+    send_json::<Dashboard>("PUT", &path, token, &body).await
+}
+
+/// DELETE /api/v1/dashboards/{id}
+pub async fn delete_dashboard(token: &str, id: i64) -> Result<(), ApiError> {
+    let path = format!("/api/v1/dashboards/{}", id);
+    delete_req(&path, token).await
+}
+
 /// Minimal percent-encoding for query values (encodes space, &, =, +).
 fn urlencoded(s: &str) -> String {
     s.chars()
