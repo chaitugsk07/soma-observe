@@ -2,16 +2,15 @@
 
 Full path to a SigNoz/KubeSense-class platform: **docs/roadmap.md** (dependency-ordered).
 
-## In progress
-
-- **Cross-signal correlation + exemplars** (roadmap #1) — trace ↔ log pivot (deep-links) + metric→trace exemplars. The substrate the service map and AI-RCA both stand on.
-
 ## Done
 
 - v1 core: OTLP metrics+logs+traces, Postgres storage, embedded admin UI.
 - Histogram query + view.
 - Release pipeline FILES (publish pending — see below).
 - Alerting: rule evaluator + webhook + Alerts UI.
+- **Cross-signal correlation + exemplars** (roadmap #1) — trace ↔ log pivot (deep-links) + metric→trace exemplars. Backend + UI shipped.
+- **Service map + span-derived RED metrics + percentiles** (roadmap #2) — per-service RED + dependency graph + service→traces pivot. Backend + UI shipped.
+- **Kubernetes topology view** (roadmap #3) — namespace→workload RED from k8s resource attrs. Backend + UI shipped.
 
 ## v1 release — publish step (outward-facing, awaiting go)
 
@@ -21,10 +20,8 @@ The release files exist (`Dockerfile`, `docker-compose.yml`, `.github/workflows/
 2. `git tag v0.1.0 && git push origin v0.1.0` triggers `release.yml`.
 3. First CI run happens on push; watch and fix sibling-checkout/permission issues.
 
-## Next (after correlation) — rationale + sequencing in docs/roadmap.md
+## Next — rationale + sequencing in docs/roadmap.md
 
-- **#2** Service map + span-derived RED metrics + percentiles.
-- **#3** Kubernetes metadata enrichment + a k8s topology view.
 - **#4** eBPF zero-code via OBI/Beyla integration — **+ columnar storage tier (the scale gate)**.
 - **#5** AI-agentic RCA + anomaly detection (on `soma-infra::llm`).
 

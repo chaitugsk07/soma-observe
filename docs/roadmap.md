@@ -10,6 +10,7 @@ for the next.
 - Query APIs + an embedded admin UI: Overview, Metrics (charts + histogram view), Logs, Traces (span waterfall), Retention, Alerts.
 - Alerting: background rule evaluator (metric-threshold + log-count) with state machine + webhook notifications.
 - CORS for direct browser OTLP; optional bearer auth; single binary + Postgres.
+- Kubernetes topology view (namespace → workload RED, from k8s resource attrs).
 
 ## The target: a SigNoz/KubeSense-class platform — 4 pillars
 1. **Agentless eBPF zero-code capture** — telemetry from running pods, no SDK.
@@ -25,7 +26,7 @@ for the next.
 2. **Service map + span-derived RED metrics + percentiles.**
    Per-service rate/error/p50/p99 derived from spans; a dependency graph from parent/child + `peer.service`. KubeSense's headline view, and the canvas eBPF data and AI-RCA both render onto. Builds on #1.
 
-3. **Kubernetes metadata enrichment + a k8s view.**
+3. *Shipped.* **Kubernetes metadata enrichment + a k8s view.**
    Tag telemetry with pod/namespace/node/deployment/workload (OTel `k8sattributes` processor → index those resource attrs → a k8s topology view). Makes it *Kube*-sense, and is the landing pad for eBPF telemetry (which is already tagged with k8s resource attrs).
 
 4. **eBPF zero-code — by integrating OBI/Beyla, not writing kernel code.**

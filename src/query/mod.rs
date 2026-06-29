@@ -1,3 +1,4 @@
+pub mod kubernetes;
 pub mod logs;
 pub mod metrics;
 pub mod services;

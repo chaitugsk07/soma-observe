@@ -417,6 +417,67 @@ pub async fn get_service_map(
     get_json::<ServiceMap>(&url, token).await
 }
 
+/// Per-workload RED metrics — mirrors server K8sWorkload.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct K8sWorkload {
+    pub workload: String,
+    pub kind: String,
+    pub pods: Vec<String>,
+    pub pod_count: i64,
+    pub span_count: i64,
+    pub error_count: i64,
+    pub error_rate: f64,
+    pub rate_per_sec: f64,
+    pub p50_ms: f64,
+    pub p90_ms: f64,
+    pub p99_ms: f64,
+}
+
+/// Namespace with workloads — mirrors server K8sNamespace.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct K8sNamespace {
+    pub name: String,
+    pub pod_count: i64,
+    pub span_count: i64,
+    pub error_count: i64,
+    pub workloads: Vec<K8sWorkload>,
+}
+
+/// Response envelope — mirrors server K8sTopologyResponse.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct K8sTopology {
+    pub namespaces: Vec<K8sNamespace>,
+    pub node_count: i64,
+}
+
+/// GET /api/v1/kubernetes?start=&end=
+pub async fn get_kubernetes_topology(
+    token: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Result<K8sTopology, ApiError> {
+    let mut url = "/api/v1/kubernetes?".to_string();
+    let mut first = true;
+    let mut push = |k: &str, v: &str| {
+        if !first {
+            url.push('&');
+        }
+        first = false;
+        url.push_str(&format!("{}={}", k, urlencoded(v)));
+    };
+    if let Some(v) = start {
+        if !v.is_empty() {
+            push("start", v);
+        }
+    }
+    if let Some(v) = end {
+        if !v.is_empty() {
+            push("end", v);
+        }
+    }
+    get_json::<K8sTopology>(&url, token).await
+}
+
 /// GET /api/v1/traces/query — returns a JSON array of TraceSummary.
 pub async fn query_traces(
     token: &str,
