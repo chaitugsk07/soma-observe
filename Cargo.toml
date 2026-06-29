@@ -28,7 +28,8 @@ chrono = { version = "0.4", features = ["serde"] }
 # types used in T4 (decode ExportMetricsServiceRequest / ExportLogsServiceRequest).
 # with-serde enables JSON deserialization for OTLP/JSON payloads.
 # gen-tonic-messages pulls in tonic (message layer only, no transport).
-opentelemetry-proto = { version = "0.28", default-features = false, features = ["gen-tonic-messages", "metrics", "logs", "with-serde"] }
+opentelemetry-proto = { version = "0.28", default-features = false, features = ["gen-tonic-messages", "metrics", "logs", "trace", "with-serde"] }
+tower-http = { version = "0.7", features = ["cors"] }
 prost = "0.13"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "json"], default-features = false }
 # ponytail: lru = bounded LRU for series_id cache; no stdlib equivalent

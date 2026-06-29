@@ -56,6 +56,12 @@ fn stats_to_rows(s: &StatsResponse) -> Vec<HashMap<String, String>> {
         },
         {
             let mut m = HashMap::new();
+            m.insert("key".to_string(), "Trace spans".to_string());
+            m.insert("value".to_string(), s.counts.spans.to_string());
+            m
+        },
+        {
+            let mut m = HashMap::new();
             m.insert("key".to_string(), "DB size".to_string());
             m.insert(
                 "value".to_string(),

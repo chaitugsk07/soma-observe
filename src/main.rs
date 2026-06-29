@@ -56,8 +56,10 @@ async fn main() -> anyhow::Result<()> {
     let partition_pool = pool.clone();
     let metrics_ret = cfg.metrics_retention_days;
     let logs_ret = cfg.logs_retention_days;
+    let traces_ret = cfg.traces_retention_days;
     tokio::spawn(async move {
-        store::partition::run_partition_manager(partition_pool, metrics_ret, logs_ret).await;
+        store::partition::run_partition_manager(partition_pool, metrics_ret, logs_ret, traces_ret)
+            .await;
     });
 
     let app_state = Arc::new(AppState::new(pool, cfg.clone()));
@@ -75,8 +77,22 @@ async fn main() -> anyhow::Result<()> {
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         // OTLP ingest endpoints (OTLP/HTTP collector standard paths)
-        .route("/v1/metrics", post(ingest::otlp_http::ingest_metrics))
-        .route("/v1/logs", post(ingest::otlp_http::ingest_logs))
+        // Each handler handles OPTIONS itself for CORS preflight.
+        .route(
+            "/v1/metrics",
+            post(ingest::otlp_http::ingest_metrics)
+                .options(ingest::otlp_http::ingest_metrics),
+        )
+        .route(
+            "/v1/logs",
+            post(ingest::otlp_http::ingest_logs)
+                .options(ingest::otlp_http::ingest_logs),
+        )
+        .route(
+            "/v1/traces",
+            post(ingest::otlp_http::ingest_traces)
+                .options(ingest::otlp_http::ingest_traces),
+        )
         // Query + discovery endpoints
         .route("/api/v1/metrics/query", get(query::metrics::query_metrics))
         .route(
@@ -88,6 +104,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(query::metrics::list_metric_series),
         )
         .route("/api/v1/logs/query", get(query::logs::query_logs))
+        .route("/api/v1/traces/query", get(query::traces::query_traces))
+        .route("/api/v1/traces/{trace_id}", get(query::traces::get_trace))
         // Admin endpoints
         .route("/health", get(admin::health))
         .route("/api/v1/admin/stats", get(admin::stats))

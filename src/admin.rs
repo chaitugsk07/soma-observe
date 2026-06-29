@@ -36,6 +36,7 @@ pub struct DataCounts {
     pub metric_points: i64,
     pub histogram_points: i64,
     pub logs: i64,
+    pub spans: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -103,7 +104,14 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Response {
     .await
     .unwrap_or(0);
 
-    // Count child partitions for our three partitioned tables via pg_inherits.
+    let spans: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM soma_observe.spans",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+
+    // Count child partitions for all partitioned tables via pg_inherits.
     let partitions: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(*)
@@ -111,7 +119,7 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Response {
         JOIN   pg_class    p  ON p.oid = i.inhparent
         JOIN   pg_namespace n ON n.oid = p.relnamespace
         WHERE  n.nspname = 'soma_observe'
-          AND  p.relname IN ('metric_point', 'metric_histogram_point', 'logs')
+          AND  p.relname IN ('metric_point', 'metric_histogram_point', 'logs', 'spans')
         "#,
     )
     .fetch_one(&state.pool)
@@ -137,6 +145,7 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Response {
             metric_points,
             histogram_points,
             logs,
+            spans,
         },
         partitions,
         db_size_bytes,
@@ -160,6 +169,8 @@ mod tests {
             auth_token,
             metrics_retention_days: 90,
             logs_retention_days: 30,
+            traces_retention_days: 7,
+            cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
         }
@@ -288,14 +299,14 @@ mod tests {
             return;
         };
         // ensure_partitions was called in test_db(); we expect >= 2 partitions
-        // per table (current + next month) for 3 tables = at least 6.
+        // per table (current + next month) for 4 tables = at least 8.
         let state = Arc::new(AppState::new(db.pool.clone(), test_config(None)));
         let resp = stats(State(state)).await;
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let parsed: StatsResponse = serde_json::from_slice(&body).unwrap();
         assert!(
-            parsed.partitions >= 6,
-            "expect >= 6 child partitions after ensure (got {})",
+            parsed.partitions >= 8,
+            "expect >= 8 child partitions after ensure (got {})",
             parsed.partitions
         );
     }

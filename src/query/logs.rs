@@ -199,6 +199,8 @@ mod tests {
             auth_token: None,
             metrics_retention_days: 90,
             logs_retention_days: 30,
+            traces_retention_days: 7,
+            cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
         }

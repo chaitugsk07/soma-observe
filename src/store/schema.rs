@@ -46,6 +46,27 @@ pub struct LogRecord {
     pub attributes: serde_json::Value,
 }
 
+/// A distributed trace span.
+#[derive(Debug, Clone)]
+pub struct SpanRecord {
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    pub name: String,
+    pub kind: Option<String>,
+    pub service_name: Option<String>,
+    pub scope_name: Option<String>,
+    pub start_time: chrono::DateTime<chrono::Utc>,
+    pub end_time: chrono::DateTime<chrono::Utc>,
+    pub duration_ns: i64,
+    pub status_code: Option<String>,
+    pub status_message: Option<String>,
+    pub resource: serde_json::Value,
+    pub attributes: serde_json::Value,
+    pub events: serde_json::Value,
+    pub links: serde_json::Value,
+}
+
 /// The key used to identify a metric series uniquely.
 /// Canonicalized from (name, kind, resource attrs, datapoint attrs).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

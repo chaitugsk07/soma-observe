@@ -1,5 +1,6 @@
 pub mod logs;
 pub mod metrics;
+pub mod traces;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;

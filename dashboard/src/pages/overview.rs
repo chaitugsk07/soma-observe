@@ -67,7 +67,7 @@ pub fn OverviewPage() -> impl IntoView {
                         })}
 
                         // Stat cards
-                        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
                             <Stat
                                 label="Metric Series"
                                 value=s.counts.series.to_string()
@@ -83,6 +83,10 @@ pub fn OverviewPage() -> impl IntoView {
                             <Stat
                                 label="Log Records"
                                 value=s.counts.logs.to_string()
+                            />
+                            <Stat
+                                label="Trace Spans"
+                                value=s.counts.spans.to_string()
                             />
                         </div>
 

@@ -75,6 +75,7 @@ pub struct DataCounts {
     pub metric_points: i64,
     pub histogram_points: i64,
     pub logs: i64,
+    pub spans: i64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -138,6 +139,39 @@ pub struct MetricQueryResponse {
     pub metric: String,
     pub unit: Option<String>,
     pub series: Vec<QuerySeries>,
+}
+
+/// Summary of a trace from GET /api/v1/traces/query
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct TraceSummary {
+    pub trace_id: String,
+    pub root_name: String,
+    pub root_service: Option<String>,
+    pub start_time: String,
+    pub duration_ms: i64,
+    pub span_count: i64,
+    pub status: String,
+}
+
+/// Full span detail from GET /api/v1/traces/:trace_id
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SpanDetail {
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    pub name: String,
+    pub kind: Option<String>,
+    pub service_name: Option<String>,
+    pub scope_name: Option<String>,
+    pub start_time: String,
+    pub end_time: String,
+    pub duration_ns: i64,
+    pub status_code: Option<String>,
+    pub status_message: Option<String>,
+    pub resource: serde_json::Value,
+    pub attributes: serde_json::Value,
+    pub events: serde_json::Value,
+    pub links: serde_json::Value,
 }
 
 /// One log record from GET /api/v1/logs/query (NDJSON)
@@ -308,6 +342,38 @@ pub async fn query_logs(
         })
         .collect();
     Ok(records)
+}
+
+/// GET /api/v1/traces/query — returns a JSON array of TraceSummary.
+pub async fn query_traces(
+    token: &str,
+    service: Option<&str>,
+    name: Option<&str>,
+    status: Option<&str>,
+    min_duration_ms: Option<&str>,
+    max_duration_ms: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    limit: Option<u32>,
+) -> Result<Vec<TraceSummary>, ApiError> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut kv = |k: &str, v: &str| parts.push(format!("{}={}", k, urlencoded(v)));
+    if let Some(v) = service { if !v.is_empty() { kv("service", v); } }
+    if let Some(v) = name { if !v.is_empty() { kv("name", v); } }
+    if let Some(v) = status { if !v.is_empty() { kv("status", v); } }
+    if let Some(v) = min_duration_ms { if !v.is_empty() { kv("min_duration_ms", v); } }
+    if let Some(v) = max_duration_ms { if !v.is_empty() { kv("max_duration_ms", v); } }
+    if let Some(v) = start { if !v.is_empty() { kv("start", v); } }
+    if let Some(v) = end { if !v.is_empty() { kv("end", v); } }
+    if let Some(n) = limit { kv("limit", &n.to_string()); }
+    let url = format!("/api/v1/traces/query?{}", parts.join("&"));
+    get_json::<Vec<TraceSummary>>(&url, token).await
+}
+
+/// GET /api/v1/traces/:trace_id — returns a JSON array of SpanDetail.
+pub async fn get_trace(token: &str, trace_id: &str) -> Result<Vec<SpanDetail>, ApiError> {
+    let url = format!("/api/v1/traces/{}", urlencoded(trace_id));
+    get_json::<Vec<SpanDetail>>(&url, token).await
 }
 
 /// Minimal percent-encoding for query values (encodes space, &, =, +).

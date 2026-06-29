@@ -23,7 +23,7 @@ use sqlx::PgPool;
 use tracing::{error, info, warn};
 
 /// Tables whose partitions we manage.
-const PARTITIONED_TABLES: &[&str] = &["metric_point", "metric_histogram_point", "logs"];
+const PARTITIONED_TABLES: &[&str] = &["metric_point", "metric_histogram_point", "logs", "spans"];
 
 /// Create the current-month and next-month partitions for all three partitioned
 /// tables if they don't already exist.
@@ -118,18 +118,24 @@ pub async fn run_partition_manager(
     pool: PgPool,
     metrics_retention_days: u32,
     logs_retention_days: u32,
+    traces_retention_days: u32,
 ) {
     // Run once immediately on startup, then every 6 hours.
     let interval = std::time::Duration::from_secs(6 * 60 * 60);
 
     loop {
-        run_once(&pool, metrics_retention_days, logs_retention_days).await;
+        run_once(&pool, metrics_retention_days, logs_retention_days, traces_retention_days).await;
         tokio::time::sleep(interval).await;
     }
 }
 
 /// Single cycle: ensure + drop for all tables.
-async fn run_once(pool: &PgPool, metrics_retention_days: u32, logs_retention_days: u32) {
+async fn run_once(
+    pool: &PgPool,
+    metrics_retention_days: u32,
+    logs_retention_days: u32,
+    traces_retention_days: u32,
+) {
     if let Err(e) = ensure_partitions(pool).await {
         error!(error = %e, "partition manager: ensure_partitions failed");
     } else {
@@ -146,6 +152,11 @@ async fn run_once(pool: &PgPool, metrics_retention_days: u32, logs_retention_day
     // logs uses its own retention.
     if let Err(e) = drop_old_partitions(pool, "logs", logs_retention_days).await {
         error!(error = %e, "partition manager: drop logs partitions failed");
+    }
+
+    // spans uses traces retention.
+    if let Err(e) = drop_old_partitions(pool, "spans", traces_retention_days).await {
+        error!(error = %e, "partition manager: drop spans partitions failed");
     }
 }
 

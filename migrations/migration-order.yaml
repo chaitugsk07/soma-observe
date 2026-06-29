@@ -7,3 +7,10 @@ versions:
         created: "2026-06-28"
         author: "soma-observe"
         why: "Bootstrap the partitioned observability schema. Child partitions are created at runtime by the partition manager (T6), not in this migration."
+  - version: 2
+    description: "Add spans table for distributed trace storage (partitioned by start_time)"
+    migrations:
+      - file: "20260629_01_spans.sql"
+        created: "2026-06-29"
+        author: "soma-observe"
+        why: "Add OTLP traces support. Spans are stored in a partitioned table with indexes for trace_id, service_name, and attribute containment queries."

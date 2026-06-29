@@ -2,7 +2,7 @@
 
 **Date:** June 2026
 
-soma-observe is a single Rust binary that receives OTLP/HTTP telemetry (metrics and logs, v1) and exposes a small OTel-faithful JSON query API for reading that data back. The install experience is: start one compose file, point your OTel SDK exporter at port 4318, query via the API using curl, your SDK, or any HTTP client. "One step" here means one command to a running, queryable observability backend — not zero dependencies, but zero new dependencies beyond the Postgres you probably already run. There is no bundled UI and no Grafana dependency in v1.
+soma-observe is a single Rust binary that receives OTLP/HTTP telemetry (metrics, logs, and traces, v1) and exposes a small OTel-faithful JSON query API for reading that data back. The install experience is: start one compose file, point your OTel SDK exporter at port 4318, query via the API using curl, your SDK, or any HTTP client. "One step" here means one command to a running, queryable observability backend — not zero dependencies, but zero new dependencies beyond the Postgres you probably already run. There is no bundled UI and no Grafana dependency in v1.
 
 ---
 
@@ -106,16 +106,19 @@ One process, one dependency (Postgres). The binary runs a single HTTP listener o
 ```
 OTel SDK / Collector
         |
-        | POST /v1/metrics, /v1/logs  (OTLP/HTTP protobuf)
+        | POST /v1/metrics, /v1/logs, /v1/traces  (OTLP/HTTP protobuf)
         v
   soma-observe :4318
-  ┌─────────────────────────────────────────┐
-  │ ingest:  POST /v1/metrics               │
-  │          POST /v1/logs                  │
-  │                                         │
-  │ query:   GET /api/v1/metrics/query      │
-  │          GET /api/v1/logs/query         │
-  └─────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────┐
+  │ ingest:  POST /v1/metrics                    │
+  │          POST /v1/logs                       │
+  │          POST /v1/traces                     │
+  │                                              │
+  │ query:   GET /api/v1/metrics/query           │
+  │          GET /api/v1/logs/query              │
+  │          GET /api/v1/traces/query            │
+  │          GET /api/v1/traces/{trace_id}       │
+  └──────────────────────────────────────────────┘
         |                   ^
         | sqlx INSERT        | SELECT
         v                   |
@@ -125,10 +128,13 @@ OTel SDK / Collector
   │  metric_point (range-partitioned) │
   │  metric_histogram_point (range-p) │
   │  logs                             │
+  │  spans (range-partitioned)        │
   └───────────────────────────────────┘
         ^
         | GET /api/v1/metrics/query
         | GET /api/v1/logs/query
+        | GET /api/v1/traces/query
+        | GET /api/v1/traces/{trace_id}
         |
   API consumer (curl / SDK / your tooling)
 ```
@@ -179,6 +185,8 @@ service:
       exporters: [otlphttp]
     logs:
       exporters: [otlphttp]
+    traces:
+      exporters: [otlphttp]
 ```
 
 ### Send a test metric with otel-cli
@@ -216,6 +224,60 @@ Partitions are managed by soma-observe itself — no TimescaleDB, no pg_partman,
 
 **Invariant:** the next partition must exist before the first data point with a timestamp in that range is written. A missing partition at the boundary is an ingest outage. The create-ahead task must run with enough lead time to guarantee the partition exists.
 
+### Traces
+
+`POST /v1/traces` accepts OTLP/HTTP spans in protobuf or JSON encoding on the same `:4318` listener.
+
+**Storage shape.** Each span is stored as one row in `soma_observe.spans` (range-partitioned by `start_time_unix_nano`, monthly). Columns: `trace_id`, `span_id`, `parent_span_id`, `name`, `kind`, `service_name`, `start_time`, `end_time`, `duration_ns`, `status` (ok | error | unset), `attributes jsonb`, `resource jsonb`, `events jsonb`, `links jsonb`. Retention is controlled by `TRACES_RETENTION_DAYS` (default 7) via partition drop, same mechanism as metrics and logs.
+
+**OTLP span model.** soma-observe stores all spans from an OTLP `ExportTraceServiceRequest` exactly as received. No aggregation or sampling is applied at ingest. Parent-child relationships are reconstructed at query time via `parent_span_id`.
+
+### CORS
+
+The three ingest endpoints (`POST /v1/metrics`, `POST /v1/logs`, `POST /v1/traces`) answer CORS preflight requests and attach `Access-Control-Allow-Origin` (default `*`, overridden by `CORS_ALLOW_ORIGIN`), allowed headers `content-type, authorization`, and allowed methods `POST, OPTIONS`. This lets a browser post OTLP directly without a proxy hop.
+
+### Instrument your frontend (browser tracing)
+
+Point the OpenTelemetry browser SDK's OTLP/HTTP trace exporter at `http://<host>:4318/v1/traces`. CORS is enabled, so the browser can post directly. The browser SDK creates the root span and propagates `traceparent` to your backend services (which also export to soma-observe), giving a single frontend-to-backend trace in one place.
+
+soma-observe does not ship a browser SDK. Use the standard OTel one:
+
+```bash
+npm install @opentelemetry/sdk-trace-web \
+            @opentelemetry/exporter-trace-otlp-http \
+            @opentelemetry/instrumentation-fetch \
+            @opentelemetry/resources \
+            @opentelemetry/semantic-conventions
+```
+
+```js
+import { WebTracerProvider } from '@opentelemetry/sdk-trace-web';
+import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { FetchInstrumentation } from '@opentelemetry/instrumentation-fetch';
+import { Resource } from '@opentelemetry/resources';
+import { SEMRESATTRS_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
+
+const provider = new WebTracerProvider({
+  resource: new Resource({ [SEMRESATTRS_SERVICE_NAME]: 'my-frontend' }),
+});
+
+provider.addSpanProcessor(
+  new BatchSpanProcessor(
+    new OTLPTraceExporter({ url: 'http://localhost:4318/v1/traces' })
+  )
+);
+
+provider.register();
+
+// Auto-instrument fetch — propagates traceparent to your backend
+new FetchInstrumentation({
+  propagateTraceHeaderCorsUrls: [/your-api\.example\.com/],
+}).enable();
+```
+
+Backend services send their spans to the same soma-observe instance, so the full frontend-to-backend trace is queryable in one place via `GET /api/v1/traces/{trace_id}`.
+
 ### Ingest robustness
 
 On write, soma-observe acquires a sqlx pool connection with a configured acquire timeout and applies a statement timeout. If the write exceeds the timeout, soma-observe returns HTTP 503 with a `Retry-After` header; the caller (OTel SDK or Collector) can retry with exponential backoff. Data points with timestamps older than the ingest window are rejected with HTTP 400 — late/out-of-order points that would land in an already-dropped partition are not accepted.
@@ -248,6 +310,8 @@ OTLP is an ingest-only protocol — OpenTelemetry defines no query or read stand
 | `GET /api/v1/metrics/series` | GET | List active series for a given metric name |
 | `GET /api/v1/metrics/query` | GET | Time-range metric query with aggregation |
 | `GET /api/v1/logs/query` | GET | Time-range log query with filter and body search |
+| `GET /api/v1/traces/query` | GET | Filterable trace summary list |
+| `GET /api/v1/traces/{trace_id}` | GET | All spans of a trace (for the waterfall) |
 
 `GET /api/v1/metrics/names` and `GET /api/v1/metrics/series` are necessary for operability: without them, with no UI and no PromQL browser, there is no way to discover what data has been ingested or what attribute combinations exist.
 
@@ -303,6 +367,59 @@ Returns newline-delimited JSON with full OTLP log-record fidelity:
 {"timestamp":"2026-06-28T10:00:00Z","severity":"ERROR","severity_number":17,"body":"connection timeout","trace_id":"4bf92f...","span_id":"00f067...","resource":{"service.name":"api"},"attributes":{"net.peer.name":"db"}}
 ```
 
+### Traces query
+
+`GET /api/v1/traces/query`
+
+Query parameters:
+
+| Param | Description |
+|---|---|
+| `service` | Filter by `service.name` |
+| `name` | Filter by root span name |
+| `status` | `ok` or `error` |
+| `min_duration_ms`, `max_duration_ms` | Duration bounds on the root span |
+| `start`, `end` | Unix seconds or RFC3339 |
+| `limit` | Maximum traces returned |
+
+Returns a JSON array of trace summaries:
+
+```json
+[
+  {
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "root_name": "GET /api/v1/things",
+    "root_service": "api",
+    "start_time": "2026-06-28T10:00:00Z",
+    "duration_ms": 142,
+    "span_count": 7,
+    "status": "ok"
+  }
+]
+```
+
+`GET /api/v1/traces/{trace_id}` returns all spans of a trace as a JSON array:
+
+```json
+[
+  {
+    "span_id": "00f067aa0ba902b7",
+    "parent_span_id": null,
+    "name": "GET /api/v1/things",
+    "kind": "SERVER",
+    "service_name": "api",
+    "start_time": "2026-06-28T10:00:00Z",
+    "end_time": "2026-06-28T10:00:00.142Z",
+    "duration_ns": 142000000,
+    "status": "ok",
+    "attributes": { "http.method": "GET", "http.route": "/api/v1/things" },
+    "resource": { "service.name": "api" },
+    "events": [],
+    "links": []
+  }
+]
+```
+
 You can now script against the query API directly — no Grafana, no plugin, no intermediary required.
 
 ---
@@ -317,6 +434,8 @@ All configuration is via environment variables, read through `soma_infra::config
 | `LISTEN_ADDR` | `0.0.0.0:4318` | Single HTTP listener for both OTLP/HTTP ingest (`POST /v1/metrics`, `POST /v1/logs`) and the OTel-faithful JSON query API (`GET /api/v1/...`). Port 4318 is the OTLP standard. |
 | `METRICS_RETENTION_DAYS` | `90` | Partition drops older than this many days. Applied on startup and via a periodic job. |
 | `LOGS_RETENTION_DAYS` | `30` | Same for logs. Logs tend to be larger; shorter default. |
+| `TRACES_RETENTION_DAYS` | `7` | Same for traces (spans table). Traces are high-volume; shorter default. |
+| `CORS_ALLOW_ORIGIN` | `*` | Value of `Access-Control-Allow-Origin` on OTLP ingest endpoints. Set to your frontend origin in production (e.g. `https://app.example.com`). |
 | `RUST_LOG` | `info` | Log level. Standard `RUST_LOG` / `tracing` env filter. |
 | `AUTH_TOKEN` | unset | If set, all ingest and query requests must include `Authorization: Bearer <token>`. Enforced via `soma_infra::web::extract_bearer`. If unset, the listener is open (suitable for localhost / trusted-network quickstart). At startup, if soma-observe binds a non-loopback address and `AUTH_TOKEN` is not set, a loud warning is emitted to stderr. |
 
@@ -378,18 +497,17 @@ You can now script against the query API — curl it, call it from your SDK, or 
 
 ## 8. Phased install evolution
 
-### v1 — current (metrics + logs, OTLP/HTTP, Postgres)
+### v1 — current (metrics + logs + traces, OTLP/HTTP, Postgres)
 
-Single binary. Single HTTP listener on :4318. Postgres via soma-infra pool. OTel-faithful JSON query API (`GET /api/v1/metrics/names`, `GET /api/v1/metrics/series`, `GET /api/v1/metrics/query`, `GET /api/v1/logs/query`). Metrics (Gauge, Sum, explicit-bucket Histogram; cumulative temporality; deltas computed at ingest) and logs only. No bundled UI. soma-schema migrations auto-run at startup under `soma_observe` schema. Optional bearer token auth via `AUTH_TOKEN`.
+Single binary. Single HTTP listener on :4318. Postgres via soma-infra pool. OTel-faithful JSON query API (`GET /api/v1/metrics/names`, `GET /api/v1/metrics/series`, `GET /api/v1/metrics/query`, `GET /api/v1/logs/query`, `GET /api/v1/traces/query`, `GET /api/v1/traces/{trace_id}`). Metrics (Gauge, Sum, explicit-bucket Histogram; cumulative temporality; deltas computed at ingest), logs, and traces (spans stored in a partitioned `soma_observe.spans` table). Embedded admin UI (traces waterfall, metrics, logs). soma-schema migrations auto-run at startup under `soma_observe` schema. Optional bearer token auth via `AUTH_TOKEN`. CORS enabled on ingest endpoints.
 
 Stable surface: the OTLP/HTTP ingest contract and the HTTP query API shape. These do not change in v2 or v3.
 
-### v2 — OTLP/gRPC + Prometheus remote-write + traces + optional UI
+### v2 — OTLP/gRPC + Prometheus remote-write + histogram percentiles/heatmap
 
 - OTLP/gRPC on :4317 via tonic (soma-infra adds tonic in v2 or soma-observe carries it directly).
 - Prometheus remote-write receiver: accepts `/api/v1/write` from any Prometheus instance or Prometheus-compatible exporter. This is what closes the legacy exporter gap — `node_exporter`, `postgres_exporter`, and the rest can point at soma-observe without an OTel Collector hop.
-- Trace ingest: OTLP spans stored as rows in Postgres with `trace_id`, `span_id`, `parent_span_id`, and `attributes jsonb`. A `/api/v1/query/traces` endpoint filters by trace ID and time range, returns all spans. No TraceQL in v2, no Gantt chart — just the retrieval layer.
-- Optional minimal built-in read-only UI (candidate feature: since v1 has no bundled UI and no Grafana dependency, v2 is the right time to evaluate a lightweight embedded dashboard if the API-only story proves insufficient for the target user).
+- Histogram percentile queries and heatmap visualization (p50/p95/p99 from stored bucket data).
 - Storage schema is additive; no migration from v1 data.
 
 ### v3 — object storage tier (when the Postgres ceiling is hit)
@@ -429,13 +547,15 @@ The schema name (`soma_observe`) and the advisory lock key are service-owned pol
 
 | Concern | Crate / Implementation |
 |---|---|
-| OTLP protobuf decode | `opentelemetry-proto` (generated types for `MetricsData`, `LogsData`) |
-| OTLP/HTTP route handlers | soma-observe axum handlers (`POST /v1/metrics`, `POST /v1/logs`) |
-| OTel-faithful JSON query API | soma-observe: `serde_json` over stored OTLP fields for `GET /api/v1/metrics/names`, `GET /api/v1/metrics/series`, `GET /api/v1/metrics/query`, `GET /api/v1/logs/query`; full resource/attribute fidelity, not flattened to a single label set |
+| OTLP protobuf decode | `opentelemetry-proto` (generated types for `MetricsData`, `LogsData`, `TracesData`) |
+| OTLP/HTTP route handlers | soma-observe axum handlers (`POST /v1/metrics`, `POST /v1/logs`, `POST /v1/traces`) |
+| CORS on ingest endpoints | `tower-http` `CorsLayer` — `Access-Control-Allow-Origin` from `CORS_ALLOW_ORIGIN`, allows `content-type, authorization`, methods `POST, OPTIONS` |
+| OTel-faithful JSON query API | soma-observe: `serde_json` over stored OTLP fields for `GET /api/v1/metrics/names`, `GET /api/v1/metrics/series`, `GET /api/v1/metrics/query`, `GET /api/v1/logs/query`, `GET /api/v1/traces/query`, `GET /api/v1/traces/{trace_id}`; full resource/attribute fidelity, not flattened to a single label set |
 | Metric write path | soma-observe: decode OTLP proto → upsert `metric_series` → convert cumulative to delta → insert into `metric_point` or `metric_histogram_point` |
 | Log write path | soma-observe: extract from OTLP proto → insert into `soma_observe.logs` |
+| Trace write path | soma-observe: extract spans from OTLP proto → insert into `soma_observe.spans` |
 | Partition lifecycle | soma-observe: startup + periodic task; CREATEs next partition ahead of the boundary, DROPs partitions older than `*_RETENTION_DAYS`; retention is partition DROP, not row DELETE |
-| Storage schema / partition policy | soma-observe migrations: normalized `metric_series` + `metric_point` + `metric_histogram_point` tables, range-partitioned by `ts`, composite B-tree `(series_id, ts)` as primary index, BRIN `(ts)` as secondary — service-owned policy |
+| Storage schema / partition policy | soma-observe migrations: normalized `metric_series` + `metric_point` + `metric_histogram_point` tables and `spans` table, range-partitioned by `ts` / `start_time`, composite B-tree index as primary, BRIN as secondary — service-owned policy |
 
 soma-infra does not provide OTLP decoding, gRPC, or the OTel-faithful query serialization. Those are not generic plumbing; they are soma-observe's application logic.
 
@@ -444,7 +564,8 @@ Cargo dependency declaration (path form for monorepo, crates.io form for standal
 ```toml
 [dependencies]
 soma-infra = { path = "../../../soma-infra", features = ["db", "tracing", "config", "signal", "web"] }
-opentelemetry-proto = { version = "0.7", features = ["metrics", "logs", "with-serde"] }
+opentelemetry-proto = { version = "0.7", features = ["metrics", "logs", "trace", "with-serde"] }
+tower-http = { version = "0.6", features = ["cors"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

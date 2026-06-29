@@ -15,10 +15,14 @@ pub struct Config {
     pub metrics_retention_days: u32,
     /// How many days to retain log data. Env: `LOGS_RETENTION_DAYS`. Default: 30.
     pub logs_retention_days: u32,
+    /// How many days to retain trace span data. Env: `TRACES_RETENTION_DAYS`. Default: 7.
+    pub traces_retention_days: u32,
     /// Reject datapoints with ts older than this many seconds. Env: `INGEST_WINDOW_SECS`. Default: 3600.
     pub ingest_window_secs: u64,
     /// Reject datapoints with ts more than this many seconds in the future. Env: `FUTURE_TOLERANCE_SECS`. Default: 300.
     pub future_tolerance_secs: u64,
+    /// Allowed CORS origin for ingest routes. Env: `CORS_ALLOW_ORIGIN`. Default: `*`.
+    pub cors_allow_origin: String,
 }
 
 impl Config {
@@ -28,16 +32,20 @@ impl Config {
         let auth_token = std::env::var("AUTH_TOKEN").ok();
         let metrics_retention_days = env_parse::<u32>("METRICS_RETENTION_DAYS")?.unwrap_or(90);
         let logs_retention_days = env_parse::<u32>("LOGS_RETENTION_DAYS")?.unwrap_or(30);
+        let traces_retention_days = env_parse::<u32>("TRACES_RETENTION_DAYS")?.unwrap_or(7);
         let ingest_window_secs = env_parse::<u64>("INGEST_WINDOW_SECS")?.unwrap_or(3600);
         let future_tolerance_secs = env_parse::<u64>("FUTURE_TOLERANCE_SECS")?.unwrap_or(300);
+        let cors_allow_origin = env_or("CORS_ALLOW_ORIGIN", "*");
         Ok(Config {
             database_url,
             listen_addr,
             auth_token,
             metrics_retention_days,
             logs_retention_days,
+            traces_retention_days,
             ingest_window_secs,
             future_tolerance_secs,
+            cors_allow_origin,
         })
     }
 }

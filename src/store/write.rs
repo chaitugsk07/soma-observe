@@ -1,6 +1,6 @@
 use sqlx::PgPool;
 
-use crate::store::schema::{HistogramPoint, LogRecord, MetricPoint};
+use crate::store::schema::{HistogramPoint, LogRecord, MetricPoint, SpanRecord};
 
 /// Write a batch of scalar metric points to `metric_point`.
 ///
@@ -118,6 +118,89 @@ pub async fn write_log_records(pool: &PgPool, records: &[LogRecord]) -> Result<(
     .bind(&span_ids)
     .bind(&resources)
     .bind(&attributes)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Write a batch of trace spans to `spans`.
+///
+/// Uses UNNEST to send all spans in one round-trip.
+/// ON CONFLICT DO NOTHING: the (start_time, trace_id, span_id) PK means duplicate
+/// writes for the same span are silently ignored — safe for at-least-once ingest.
+pub async fn write_spans(pool: &PgPool, spans: &[SpanRecord]) -> Result<(), sqlx::Error> {
+    if spans.is_empty() {
+        return Ok(());
+    }
+
+    let trace_ids: Vec<&str> = spans.iter().map(|s| s.trace_id.as_str()).collect();
+    let span_ids: Vec<&str> = spans.iter().map(|s| s.span_id.as_str()).collect();
+    let parent_span_ids: Vec<Option<&str>> =
+        spans.iter().map(|s| s.parent_span_id.as_deref()).collect();
+    let names: Vec<&str> = spans.iter().map(|s| s.name.as_str()).collect();
+    let kinds: Vec<Option<&str>> = spans.iter().map(|s| s.kind.as_deref()).collect();
+    let service_names: Vec<Option<&str>> =
+        spans.iter().map(|s| s.service_name.as_deref()).collect();
+    let scope_names: Vec<Option<&str>> = spans.iter().map(|s| s.scope_name.as_deref()).collect();
+    let start_times: Vec<chrono::DateTime<chrono::Utc>> =
+        spans.iter().map(|s| s.start_time).collect();
+    let end_times: Vec<chrono::DateTime<chrono::Utc>> =
+        spans.iter().map(|s| s.end_time).collect();
+    let duration_ns: Vec<i64> = spans.iter().map(|s| s.duration_ns).collect();
+    let status_codes: Vec<Option<&str>> =
+        spans.iter().map(|s| s.status_code.as_deref()).collect();
+    let status_messages: Vec<Option<&str>> =
+        spans.iter().map(|s| s.status_message.as_deref()).collect();
+    let resources: Vec<&serde_json::Value> = spans.iter().map(|s| &s.resource).collect();
+    let attributes: Vec<&serde_json::Value> = spans.iter().map(|s| &s.attributes).collect();
+    let events: Vec<&serde_json::Value> = spans.iter().map(|s| &s.events).collect();
+    let links: Vec<&serde_json::Value> = spans.iter().map(|s| &s.links).collect();
+
+    sqlx::query(
+        r#"
+        INSERT INTO soma_observe.spans (
+            trace_id, span_id, parent_span_id, name, kind, service_name, scope_name,
+            start_time, end_time, duration_ns, status_code, status_message,
+            resource, attributes, events, links
+        )
+        SELECT * FROM UNNEST(
+            $1::text[],
+            $2::text[],
+            $3::text[],
+            $4::text[],
+            $5::text[],
+            $6::text[],
+            $7::text[],
+            $8::timestamptz[],
+            $9::timestamptz[],
+            $10::bigint[],
+            $11::text[],
+            $12::text[],
+            $13::jsonb[],
+            $14::jsonb[],
+            $15::jsonb[],
+            $16::jsonb[]
+        )
+        ON CONFLICT (start_time, trace_id, span_id) DO NOTHING
+        "#,
+    )
+    .bind(&trace_ids)
+    .bind(&span_ids)
+    .bind(&parent_span_ids)
+    .bind(&names)
+    .bind(&kinds)
+    .bind(&service_names)
+    .bind(&scope_names)
+    .bind(&start_times)
+    .bind(&end_times)
+    .bind(&duration_ns)
+    .bind(&status_codes)
+    .bind(&status_messages)
+    .bind(&resources)
+    .bind(&attributes)
+    .bind(&events)
+    .bind(&links)
     .execute(pool)
     .await?;
 

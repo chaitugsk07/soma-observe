@@ -109,6 +109,8 @@ mod tests {
             auth_token: None, // no token — open access
             metrics_retention_days: 90,
             logs_retention_days: 30,
+            traces_retention_days: 7,
+            cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
         };
@@ -157,6 +159,8 @@ mod tests {
             auth_token: Some("secret123".to_string()),
             metrics_retention_days: 90,
             logs_retention_days: 30,
+            traces_retention_days: 7,
+            cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
         };

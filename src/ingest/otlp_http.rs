@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     body::Bytes,
     extract::{Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -13,8 +13,12 @@ use opentelemetry_proto::tonic::{
         metrics::v1::{
             ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
         },
+        trace::v1::{
+            ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
+        },
     },
     metrics::v1::{metric::Data, AggregationTemporality},
+    trace::v1::{span::SpanKind, status::StatusCode as SpanStatusCode},
 };
 use prost::Message;
 use serde_json::json;
@@ -23,8 +27,8 @@ use tracing::{debug, warn};
 use crate::{
     state::AppState,
     store::{
-        schema::{canonical_json, HistogramPoint, LogRecord, MetricPoint, Series, SeriesKey},
-        write::{write_histogram_points, write_log_records, write_metric_points},
+        schema::{canonical_json, HistogramPoint, LogRecord, MetricPoint, Series, SeriesKey, SpanRecord},
+        write::{write_histogram_points, write_log_records, write_metric_points, write_spans},
     },
 };
 
@@ -136,6 +140,21 @@ fn logs_response(rejected: i64, message: &str) -> (StatusCode, Vec<u8>, &'static
     (StatusCode::OK, body, JSON_CT)
 }
 
+fn traces_response(rejected: i64, message: &str) -> (StatusCode, Vec<u8>, &'static str) {
+    let resp = ExportTraceServiceResponse {
+        partial_success: if rejected > 0 || !message.is_empty() {
+            Some(ExportTracePartialSuccess {
+                rejected_spans: rejected,
+                error_message: message.to_string(),
+            })
+        } else {
+            None
+        },
+    };
+    let body = serde_json::to_vec(&resp).unwrap_or_default();
+    (StatusCode::OK, body, JSON_CT)
+}
+
 /// Build a 503 + Retry-After response for write timeout backpressure.
 fn service_unavailable() -> Response {
     (
@@ -146,13 +165,17 @@ fn service_unavailable() -> Response {
         .into_response()
 }
 
-/// Normalize OTLP/JSON payload so that string-encoded uint64 fields in
-/// `HistogramDataPoint` (`count`, `bucketCounts`) are converted to JSON numbers.
+/// Normalize OTLP/JSON payload so that string-encoded uint64 fields are converted
+/// to JSON numbers before deserialization.
 ///
 /// The OTLP/JSON spec encodes uint64 as JSON strings, but `opentelemetry-proto`
-/// with `with-serde` does not register a string deserializer for these two fields,
-/// causing serde to silently default them to 0/[]. Pre-normalizing the Value before
-/// deserialization fixes the mismatch without new dependencies or custom serde wrappers.
+/// with `with-serde` does not register a string deserializer for all such fields.
+/// Pre-normalizing the Value before deserialization fixes the mismatch without new
+/// dependencies or custom serde wrappers.
+///
+/// Handles:
+/// - `resourceMetrics[*].scopeMetrics[*].metrics[*].histogram.dataPoints[*].{count,bucketCounts}`
+/// - `resourceSpans[*].scopeSpans[*].spans[*].{startTimeUnixNano,endTimeUnixNano}`
 ///
 /// Malformed / missing fields are skipped; the normal serde path handles them.
 fn normalize_otlp_json(body: &[u8]) -> Result<Vec<u8>, String> {
@@ -211,6 +234,36 @@ fn normalize_otlp_json(body: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
 
+    // Walk resourceSpans[*].scopeSpans[*].spans[*].{startTimeUnixNano,endTimeUnixNano}
+    // opentelemetry-proto uses a custom serde for these (serialize_u64_to_string /
+    // deserialize_string_to_u64) which handles string→u64.  However, some SDKs emit
+    // them as plain JSON numbers.  The custom deserializer only accepts strings, so we
+    // normalise number→string here so both forms work.
+    if let Some(rss) = root
+        .get_mut("resourceSpans")
+        .and_then(|v| v.as_array_mut())
+    {
+        for rs in rss {
+            if let Some(sss) = rs
+                .get_mut("scopeSpans")
+                .and_then(|v| v.as_array_mut())
+            {
+                for ss in sss {
+                    if let Some(spans) = ss.get_mut("spans").and_then(|v| v.as_array_mut()) {
+                        for span in spans {
+                            // startTimeUnixNano / endTimeUnixNano: number → string
+                            for field in ["startTimeUnixNano", "endTimeUnixNano"] {
+                                if let Some(n) = span.get(field).and_then(|v| v.as_u64()) {
+                                    span[field] = serde_json::Value::String(n.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     serde_json::to_vec(&root).map_err(|e| format!("json re-serialize: {e}"))
 }
 
@@ -246,6 +299,82 @@ fn decode_logs(headers: &HeaderMap, body: &Bytes) -> Result<ExportLogsServiceReq
     }
 }
 
+fn decode_traces(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<ExportTraceServiceRequest, String> {
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if ct.starts_with(PROTOBUF_CT) {
+        ExportTraceServiceRequest::decode(body.as_ref())
+            .map_err(|e| format!("protobuf decode: {e}"))
+    } else {
+        let normalized = normalize_otlp_json(body.as_ref())?;
+        serde_json::from_slice::<ExportTraceServiceRequest>(&normalized)
+            .map_err(|e| format!("json decode: {e}"))
+    }
+}
+
+/// Convert SpanKind enum value to text.
+fn span_kind_text(kind: i32) -> Option<String> {
+    match SpanKind::try_from(kind).unwrap_or(SpanKind::Unspecified) {
+        SpanKind::Unspecified => None,
+        SpanKind::Internal => Some("Internal".to_string()),
+        SpanKind::Server => Some("Server".to_string()),
+        SpanKind::Client => Some("Client".to_string()),
+        SpanKind::Producer => Some("Producer".to_string()),
+        SpanKind::Consumer => Some("Consumer".to_string()),
+    }
+}
+
+/// Convert StatusCode enum to text.
+fn status_code_text(code: i32) -> Option<String> {
+    match SpanStatusCode::try_from(code).unwrap_or(SpanStatusCode::Unset) {
+        SpanStatusCode::Unset => None,
+        SpanStatusCode::Ok => Some("Ok".to_string()),
+        SpanStatusCode::Error => Some("Error".to_string()),
+    }
+}
+
+/// Check whether bytes are all-zero (OTLP unset id).
+fn bytes_are_zero(b: &[u8]) -> bool {
+    b.is_empty() || b.iter().all(|&x| x == 0)
+}
+
+/// Respond to CORS OPTIONS preflight for ingest routes.
+///
+/// Returns 204 No Content with the required CORS headers.
+pub fn cors_preflight(cors_origin: &str) -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            ("Access-Control-Allow-Origin", cors_origin.to_string()),
+            (
+                "Access-Control-Allow-Headers",
+                "content-type, authorization".to_string(),
+            ),
+            (
+                "Access-Control-Allow-Methods",
+                "POST, OPTIONS".to_string(),
+            ),
+        ],
+        "",
+    )
+        .into_response()
+}
+
+/// Inject CORS headers onto an existing Response.
+fn with_cors(mut resp: Response, cors_origin: &str) -> Response {
+    let headers = resp.headers_mut();
+    headers.insert(
+        "Access-Control-Allow-Origin",
+        cors_origin.parse().unwrap_or_else(|_| "*".parse().unwrap()),
+    );
+    resp
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 /// POST /v1/metrics — receive OTLP/HTTP metrics export request.
@@ -258,6 +387,9 @@ fn decode_logs(headers: &HeaderMap, body: &Bytes) -> Result<ExportLogsServiceReq
 /// Converts cumulative Sum to per-series delta using LRU cache; on value drop (reset),
 /// stores the new value as the delta.
 pub async fn ingest_metrics(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if request.method() == Method::OPTIONS {
+        return cors_preflight(&state.config.cors_allow_origin);
+    }
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
         Ok(b) => b,
@@ -547,7 +679,8 @@ pub async fn ingest_metrics(State(state): State<Arc<AppState>>, request: Request
 
     let reject_msg = reject_reasons.join("; ");
     let (status, body, ct) = metrics_response(rejected, &reject_msg);
-    (status, [(header::CONTENT_TYPE, ct)], body).into_response()
+    let resp = (status, [(header::CONTENT_TYPE, ct)], body).into_response();
+    with_cors(resp, &state.config.cors_allow_origin)
 }
 
 /// POST /v1/logs — receive OTLP/HTTP logs export request.
@@ -558,6 +691,9 @@ pub async fn ingest_metrics(State(state): State<Arc<AppState>>, request: Request
 /// Maps each LogRecord to a store::schema::LogRecord and batch-writes them.
 /// Datapoints outside the ingest window are counted as rejected.
 pub async fn ingest_logs(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if request.method() == Method::OPTIONS {
+        return cors_preflight(&state.config.cors_allow_origin);
+    }
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
         Ok(b) => b,
@@ -649,7 +785,172 @@ pub async fn ingest_logs(State(state): State<Arc<AppState>>, request: Request) -
     }
 
     let (status, body, ct) = logs_response(rejected, "");
-    (status, [(header::CONTENT_TYPE, ct)], body).into_response()
+    let resp = (status, [(header::CONTENT_TYPE, ct)], body).into_response();
+    with_cors(resp, &state.config.cors_allow_origin)
+}
+
+/// POST /v1/traces — receive OTLP/HTTP traces export request.
+///
+/// Accepts both protobuf (`application/x-protobuf`) and JSON
+/// (`application/json`) content types per the OTLP/HTTP spec.
+///
+/// Maps each Span to a SpanRecord and batch-writes them.
+/// Spans outside the ingest window are counted as rejected.
+pub async fn ingest_traces(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    // Handle CORS preflight.
+    if request.method() == Method::OPTIONS {
+        return cors_preflight(&state.config.cors_allow_origin);
+    }
+
+    let (parts, body) = request.into_parts();
+    let body = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "body read error").into_response(),
+    };
+
+    let req = match decode_traces(&parts.headers, &body) {
+        Ok(r) => r,
+        Err(e) => {
+            debug!(error = %e, "failed to decode traces request");
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
+    };
+
+    let ingest_window = state.config.ingest_window_secs;
+    let future_tol = state.config.future_tolerance_secs;
+
+    let mut span_records: Vec<SpanRecord> = Vec::new();
+    let mut rejected: i64 = 0;
+
+    for rs in &req.resource_spans {
+        let resource_json = rs
+            .resource
+            .as_ref()
+            .map(|r| kv_to_json(&r.attributes))
+            .unwrap_or_else(|| json!({}));
+
+        let service_name = rs
+            .resource
+            .as_ref()
+            .and_then(|r| {
+                r.attributes
+                    .iter()
+                    .find(|kv| kv.key == "service.name")
+                    .and_then(|kv| {
+                        use opentelemetry_proto::tonic::common::v1::any_value::Value as AV;
+                        match kv.value.as_ref()?.value.as_ref()? {
+                            AV::StringValue(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    })
+            });
+
+        for ss in &rs.scope_spans {
+            let scope_name = ss.scope.as_ref().map(|s| s.name.clone()).filter(|s| !s.is_empty());
+
+            for span in &ss.spans {
+                let start_time = match nano_to_dt(span.start_time_unix_nano) {
+                    Some(t) => t,
+                    None => {
+                        rejected += 1;
+                        continue;
+                    }
+                };
+                if !ts_in_window(start_time, ingest_window, future_tol) {
+                    rejected += 1;
+                    continue;
+                }
+
+                let end_time = nano_to_dt(span.end_time_unix_nano).unwrap_or(start_time);
+                let duration_ns = (span.end_time_unix_nano as i64)
+                    .saturating_sub(span.start_time_unix_nano as i64)
+                    .max(0);
+
+                let trace_id = if bytes_are_zero(&span.trace_id) {
+                    rejected += 1;
+                    continue;
+                } else {
+                    bytes_to_hex(&span.trace_id)
+                };
+                let span_id = if bytes_are_zero(&span.span_id) {
+                    rejected += 1;
+                    continue;
+                } else {
+                    bytes_to_hex(&span.span_id)
+                };
+                let parent_span_id = if bytes_are_zero(&span.parent_span_id) {
+                    None
+                } else {
+                    Some(bytes_to_hex(&span.parent_span_id))
+                };
+
+                let status_code = span.status.as_ref().and_then(|s| status_code_text(s.code));
+                let status_message = span
+                    .status
+                    .as_ref()
+                    .filter(|s| !s.message.is_empty())
+                    .map(|s| s.message.clone());
+
+                // Encode events as JSON array of objects.
+                let events = serde_json::Value::Array(
+                    span.events
+                        .iter()
+                        .map(|e| {
+                            json!({
+                                "name": e.name,
+                                "time_unix_nano": e.time_unix_nano,
+                                "attributes": kv_to_json(&e.attributes),
+                            })
+                        })
+                        .collect(),
+                );
+
+                // Encode links as JSON array of objects.
+                let links = serde_json::Value::Array(
+                    span.links
+                        .iter()
+                        .map(|l| {
+                            json!({
+                                "trace_id": bytes_to_hex(&l.trace_id),
+                                "span_id": bytes_to_hex(&l.span_id),
+                                "attributes": kv_to_json(&l.attributes),
+                            })
+                        })
+                        .collect(),
+                );
+
+                span_records.push(SpanRecord {
+                    trace_id,
+                    span_id,
+                    parent_span_id,
+                    name: span.name.clone(),
+                    kind: span_kind_text(span.kind),
+                    service_name: service_name.clone(),
+                    scope_name: scope_name.clone(),
+                    start_time,
+                    end_time,
+                    duration_ns,
+                    status_code,
+                    status_message,
+                    resource: resource_json.clone(),
+                    attributes: kv_to_json(&span.attributes),
+                    events,
+                    links,
+                });
+            }
+        }
+    }
+
+    if !span_records.is_empty() {
+        if let Err(e) = write_spans(&state.pool, &span_records).await {
+            warn!(error = %e, "write_spans failed");
+            return service_unavailable();
+        }
+    }
+
+    let (status, body, ct) = traces_response(rejected, "");
+    let resp = (status, [(header::CONTENT_TYPE, ct)], body).into_response();
+    with_cors(resp, &state.config.cors_allow_origin)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -992,6 +1293,8 @@ mod tests {
             auth_token: None,
             metrics_retention_days: 90,
             logs_retention_days: 30,
+            traces_retention_days: 7,
+            cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
         };
@@ -1128,6 +1431,8 @@ mod tests {
             auth_token: None,
             metrics_retention_days: 90,
             logs_retention_days: 30,
+            traces_retention_days: 7,
+            cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
         };
@@ -1228,6 +1533,8 @@ mod tests {
             auth_token: None,
             metrics_retention_days: 90,
             logs_retention_days: 30,
+            traces_retention_days: 7,
+            cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
         };
@@ -1350,6 +1657,8 @@ mod tests {
             auth_token: None,
             metrics_retention_days: 90,
             logs_retention_days: 30,
+            traces_retention_days: 7,
+            cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
         };
