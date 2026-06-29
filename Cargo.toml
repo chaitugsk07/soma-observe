@@ -12,7 +12,7 @@ name = "soma-observe"
 path = "src/main.rs"
 
 [dependencies]
-soma-infra = { path = "../soma-infra", features = ["db", "tracing", "config", "signal", "web", "testing"] }
+soma-infra = { path = "../soma-infra", features = ["db", "tracing", "config", "signal", "web", "testing", "http"] }
 rust-embed = "8"
 soma-schema = { path = "../soma-schema", version = "0.4", default-features = false }
 include_dir = "0.7"

@@ -14,3 +14,10 @@ versions:
         created: "2026-06-29"
         author: "soma-observe"
         why: "Add OTLP traces support. Spans are stored in a partitioned table with indexes for trace_id, service_name, and attribute containment queries."
+  - version: 3
+    description: "Add alerting tables: alert_rules (metric/log threshold config) and alert_state (ok/pending/firing evaluator state)"
+    migrations:
+      - file: "20260629_02_alerts.sql"
+        created: "2026-06-29"
+        author: "soma-observe"
+        why: "Bootstrap minimal-credible alerting: metric-threshold and log-count rules with webhook notifications."

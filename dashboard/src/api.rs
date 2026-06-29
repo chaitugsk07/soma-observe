@@ -376,6 +376,130 @@ pub async fn get_trace(token: &str, trace_id: &str) -> Result<Vec<SpanDetail>, A
     get_json::<Vec<SpanDetail>>(&url, token).await
 }
 
+// ── Alert types ───────────────────────────────────────────────────────────────
+
+/// Mirrors server `AlertStateRow` — all fields nullable except `state` and `since`.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AlertStateRow {
+    pub state: String,
+    pub since: String,
+    pub last_value: Option<f64>,
+    pub last_eval: Option<String>,
+    pub last_notified: Option<String>,
+    pub last_message: Option<String>,
+}
+
+/// Mirrors server `AlertRule` — `state` is nullable (None if never evaluated).
+/// `config` is kept as `serde_json::Value` to avoid fighting the metric|log union;
+/// the UI reads individual fields by key at display / submit time.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AlertRule {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub enabled: bool,
+    pub severity: String,
+    pub config: serde_json::Value,
+    pub for_secs: i32,
+    pub webhook_url: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    // server uses skip_serializing_if = "Option::is_none" so the field may be
+    // absent in JSON — use #[serde(default)] to coerce missing → None.
+    #[serde(default)]
+    pub state: Option<AlertStateRow>,
+}
+
+/// Mirrors the anonymous `ActiveAlert` struct serialised by `list_active_alerts`.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ActiveAlert {
+    pub id: i64,
+    pub name: String,
+    pub severity: String,
+    pub kind: String,
+    pub state: String,
+    pub since: String,
+    pub last_value: Option<f64>,
+    pub last_eval: Option<String>,
+    pub last_message: Option<String>,
+}
+
+// ── Mutation helpers ──────────────────────────────────────────────────────────
+
+async fn send_json<T: serde::de::DeserializeOwned>(
+    method: &str,
+    path: &str,
+    token: &str,
+    body: &serde_json::Value,
+) -> Result<T, ApiError> {
+    let builder = match method {
+        "POST" => gloo_net::http::Request::post(path),
+        "PUT" => gloo_net::http::Request::put(path),
+        _ => unreachable!(),
+    };
+    let mut builder = builder.header("Content-Type", "application/json");
+    if !token.is_empty() {
+        builder = builder.header("Authorization", &format!("Bearer {}", token));
+    }
+    let resp = builder
+        .body(serde_json::to_string(body).unwrap_or_default())
+        .map_err(|e| ApiError { status: 0, message: e.to_string() })?
+        .send()
+        .await
+        .map_err(|e| ApiError { status: 0, message: e.to_string() })?;
+    handle_response(resp).await
+}
+
+async fn delete_req(path: &str, token: &str) -> Result<(), ApiError> {
+    let mut req = gloo_net::http::Request::delete(path);
+    if !token.is_empty() {
+        req = req.header("Authorization", &format!("Bearer {}", token));
+    }
+    let resp = req.send().await.map_err(|e| ApiError { status: 0, message: e.to_string() })?;
+    if resp.ok() || resp.status() == 204 {
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(ApiError { status: resp.status(), message: body })
+    }
+}
+
+// ── Alert API functions ───────────────────────────────────────────────────────
+
+/// GET /api/v1/alerts/rules
+pub async fn list_alert_rules(token: &str) -> Result<Vec<AlertRule>, ApiError> {
+    get_json::<Vec<AlertRule>>("/api/v1/alerts/rules", token).await
+}
+
+/// POST /api/v1/alerts/rules
+pub async fn create_alert_rule(
+    token: &str,
+    body: &serde_json::Value,
+) -> Result<AlertRule, ApiError> {
+    send_json::<AlertRule>("POST", "/api/v1/alerts/rules", token, body).await
+}
+
+/// PUT /api/v1/alerts/rules/{id}
+pub async fn update_alert_rule(
+    token: &str,
+    id: i64,
+    body: &serde_json::Value,
+) -> Result<AlertRule, ApiError> {
+    let path = format!("/api/v1/alerts/rules/{}", id);
+    send_json::<AlertRule>("PUT", &path, token, body).await
+}
+
+/// DELETE /api/v1/alerts/rules/{id}
+pub async fn delete_alert_rule(token: &str, id: i64) -> Result<(), ApiError> {
+    let path = format!("/api/v1/alerts/rules/{}", id);
+    delete_req(&path, token).await
+}
+
+/// GET /api/v1/alerts
+pub async fn list_active_alerts(token: &str) -> Result<Vec<ActiveAlert>, ApiError> {
+    get_json::<Vec<ActiveAlert>>("/api/v1/alerts", token).await
+}
+
 /// Minimal percent-encoding for query values (encodes space, &, =, +).
 fn urlencoded(s: &str) -> String {
     s.chars()

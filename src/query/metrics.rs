@@ -642,6 +642,7 @@ mod tests {
             cors_allow_origin: "*".into(),
                 ingest_window_secs: 3600,
                 future_tolerance_secs: 300,
+                alert_eval_interval_secs: 30,
             },
         ));
 
@@ -685,6 +686,7 @@ mod tests {
             cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
+            alert_eval_interval_secs: 30,
         };
         let state = Arc::new(crate::state::AppState::new(db.pool.clone(), cfg));
 
@@ -739,6 +741,7 @@ mod tests {
             cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
+            alert_eval_interval_secs: 30,
         };
         let state = Arc::new(crate::state::AppState::new(db.pool.clone(), cfg));
 
@@ -823,6 +826,7 @@ mod tests {
             cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
+            alert_eval_interval_secs: 30,
         };
         let state = Arc::new(crate::state::AppState::new(db.pool.clone(), cfg));
 
@@ -892,6 +896,7 @@ mod tests {
             cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
+            alert_eval_interval_secs: 30,
         };
         let state = Arc::new(crate::state::AppState::new(db.pool.clone(), cfg));
 
@@ -947,6 +952,7 @@ mod tests {
             cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
+            alert_eval_interval_secs: 30,
         };
         let state = Arc::new(crate::state::AppState::new(db.pool.clone(), cfg));
 
@@ -1016,6 +1022,7 @@ mod tests {
             cors_allow_origin: "*".into(),
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
+            alert_eval_interval_secs: 30,
         }
     }
 

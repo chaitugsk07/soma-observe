@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod admin;
+mod alerts;
 mod auth;
 mod config;
 mod ingest;
@@ -10,7 +11,7 @@ mod query;
 mod state;
 mod store;
 
-use axum::{http::Uri, middleware, routing::get, routing::post, Router};
+use axum::{http::Uri, middleware, routing::get, routing::post, routing::put, Router};
 use config::Config;
 use portal::Portal;
 use state::AppState;
@@ -62,6 +63,13 @@ async fn main() -> anyhow::Result<()> {
             .await;
     });
 
+    // Spawn the alert evaluator background task.
+    let alert_pool = pool.clone();
+    let alert_interval = cfg.alert_eval_interval_secs;
+    tokio::spawn(async move {
+        alerts::eval::run_alert_evaluator(alert_pool, alert_interval).await;
+    });
+
     let app_state = Arc::new(AppState::new(pool, cfg.clone()));
     let app = build_router(app_state);
 
@@ -106,6 +114,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/logs/query", get(query::logs::query_logs))
         .route("/api/v1/traces/query", get(query::traces::query_traces))
         .route("/api/v1/traces/{trace_id}", get(query::traces::get_trace))
+        // Alert CRUD + state endpoints
+        .route(
+            "/api/v1/alerts/rules",
+            get(alerts::list_rules).post(alerts::create_rule),
+        )
+        .route(
+            "/api/v1/alerts/rules/{id}",
+            put(alerts::update_rule).delete(alerts::delete_rule),
+        )
+        .route("/api/v1/alerts", get(alerts::list_active_alerts))
         // Admin endpoints
         .route("/health", get(admin::health))
         .route("/api/v1/admin/stats", get(admin::stats))

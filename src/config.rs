@@ -23,6 +23,8 @@ pub struct Config {
     pub future_tolerance_secs: u64,
     /// Allowed CORS origin for ingest routes. Env: `CORS_ALLOW_ORIGIN`. Default: `*`.
     pub cors_allow_origin: String,
+    /// How often the alert evaluator runs (seconds). Env: `ALERT_EVAL_INTERVAL_SECS`. Default: 30.
+    pub alert_eval_interval_secs: u64,
 }
 
 impl Config {
@@ -36,6 +38,8 @@ impl Config {
         let ingest_window_secs = env_parse::<u64>("INGEST_WINDOW_SECS")?.unwrap_or(3600);
         let future_tolerance_secs = env_parse::<u64>("FUTURE_TOLERANCE_SECS")?.unwrap_or(300);
         let cors_allow_origin = env_or("CORS_ALLOW_ORIGIN", "*");
+        let alert_eval_interval_secs =
+            env_parse::<u64>("ALERT_EVAL_INTERVAL_SECS")?.unwrap_or(30);
         Ok(Config {
             database_url,
             listen_addr,
@@ -46,6 +50,7 @@ impl Config {
             ingest_window_secs,
             future_tolerance_secs,
             cors_allow_origin,
+            alert_eval_interval_secs,
         })
     }
 }

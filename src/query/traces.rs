@@ -327,6 +327,7 @@ mod tests {
             ingest_window_secs: 3600,
             future_tolerance_secs: 300,
             cors_allow_origin: "*".into(),
+            alert_eval_interval_secs: 30,
         }
     }
 
